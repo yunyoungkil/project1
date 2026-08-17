@@ -83,6 +83,30 @@ def _fetch_top_rows(db_path: Path, limit: int, since: str | None = None, until: 
         return [dict(r) for r in conn.execute(query, params).fetchall()]
 
 
+def get_video_matches(db_path: Path, video_id: str) -> dict:
+    """video_keyword_matches is the source of truth for what a video actually matched --
+    videos.problem_category/matched_keyword only ever hold the first match for backward
+    compatibility. This returns every distinct problem and search query a video matched, so
+    report sections can show all of them instead of silently picking one."""
+    with connect(db_path) as conn:
+        problem_rows = conn.execute(
+            """
+            SELECT DISTINCT category, problem_id, problem_label FROM video_keyword_matches
+            WHERE video_id = ? AND problem_label IS NOT NULL
+            ORDER BY category, problem_label
+            """,
+            (video_id,),
+        ).fetchall()
+        query_rows = conn.execute(
+            "SELECT DISTINCT search_query FROM video_keyword_matches WHERE video_id = ? ORDER BY search_query",
+            (video_id,),
+        ).fetchall()
+    return {
+        "problems": [dict(r) for r in problem_rows],
+        "search_queries": [r["search_query"] for r in query_rows],
+    }
+
+
 def problem_frequency(db_path: Path) -> Counter:
     """Counts each (video, problem) pair once, so a video matched by several search queries under
     the same problem doesn't inflate that problem's frequency."""
@@ -108,7 +132,7 @@ def _fetch_category_top_rows(db_path: Path, category: str, limit: int) -> list[d
         return [dict(r) for r in conn.execute(query, (category, limit)).fetchall()]
 
 
-def _write_outlier_block(lines: list[str], rows: list[dict], patterns: dict[str, "object"] | None = None) -> None:
+def _write_outlier_block(db_path: Path, lines: list[str], rows: list[dict], patterns: dict[str, "object"] | None = None) -> None:
     for i, r in enumerate(rows, start=1):
         lines.append(f"{i}. {r['title']}")
         lines.append(f"   - Channel: {r.get('channel_title') or r['channel_id']}")
@@ -116,8 +140,16 @@ def _write_outlier_block(lines: list[str], rows: list[dict], patterns: dict[str,
         lines.append(f"   - Channel baseline (median): {_fmt(r.get('channel_median_views'))}")
         lines.append(f"   - Outlier: {_fmt(r.get('outlier_ratio'))}X ({r.get('outlier_grade')})")
         lines.append(f"   - Opportunity: {_fmt(r.get('opportunity_score'))}/100")
-        lines.append(f"   - Viewer problem: {r.get('problem_category') or '-'}")
-        lines.append(f"   - Matched search query: {r.get('matched_keyword') or '-'}")
+
+        matches = get_video_matches(db_path, r["video_id"])
+        problem_labels = [p["problem_label"] for p in matches["problems"]]
+        lines.append("   - Viewer problems:")
+        for label in problem_labels or ["-"]:
+            lines.append(f"     - {label}")
+        lines.append("   - Matched search queries:")
+        for query in matches["search_queries"] or ["-"]:
+            lines.append(f"     - {query}")
+
         if patterns and r["video_id"] in patterns:
             p = patterns[r["video_id"]]
             lines.append(f"   - Title archetype: {ARCHETYPES.get(p.primary_archetype, p.primary_archetype)}")
@@ -197,7 +229,7 @@ def build_weekly_report(
     lines.append(f"## 2. 이번 주 발견 Outlier TOP{min(top_n, len(this_week_rows))}")
     lines.append("")
     if this_week_rows:
-        _write_outlier_block(lines, this_week_rows, patterns)
+        _write_outlier_block(db_path, lines, this_week_rows, patterns)
     else:
         lines.append("- 이번 주 새로 발견된 영상이 없습니다.")
         lines.append("")
@@ -206,7 +238,7 @@ def build_weekly_report(
     lines.append("")
     lines.append("(발견 시점과 무관하게 DB 전체에서 여전히 참고 가치가 높은 outlier)")
     lines.append("")
-    _write_outlier_block(lines, evergreen_rows, patterns)
+    _write_outlier_block(db_path, lines, evergreen_rows, patterns)
 
     lines.append("## 4. 카테고리별 Outlier")
     lines.append("")
@@ -215,7 +247,7 @@ def build_weekly_report(
         if cat_rows:
             lines.append(f"### {category} TOP{min(category_top_n, len(cat_rows))}")
             lines.append("")
-            _write_outlier_block(lines, cat_rows)
+            _write_outlier_block(db_path, lines, cat_rows)
         else:
             lines.append(f"### {category}")
             lines.append("")

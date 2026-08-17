@@ -1,7 +1,13 @@
 from pathlib import Path
 
 from research.db import connect, init_db
-from research.weekly_report import _fetch_category_top_rows, _fetch_top_rows, problem_frequency
+from research.weekly_report import (
+    _fetch_category_top_rows,
+    _fetch_top_rows,
+    _write_outlier_block,
+    get_video_matches,
+    problem_frequency,
+)
 
 
 def _seed_video(conn, video_id, channel_id, title, view_count=1000):
@@ -106,3 +112,101 @@ def test_problem_frequency_video_can_have_multiple_problems(tmp_path):
     counter = problem_frequency(db_path)
     assert counter["problem A"] == 1
     assert counter["problem B"] == 1
+
+
+def test_get_video_matches_returns_all_distinct_problems(tmp_path):
+    """A video matched to two different problems must show both -- videos.problem_category only
+    ever holds the first match, so the report display can't rely on it alone."""
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        _seed_video(conn, "v1", "c1", "video 1")
+        _seed_match(conn, "v1", "reading", "영어 단어 읽는 법", "cannot_read_words", "알파벳은 아는데 영어 단어를 못 읽는다")
+        _seed_match(conn, "v1", "reading", "영어 강세", "word_stress", "영어 강세 위치를 어떻게 아는가")
+
+    matches = get_video_matches(db_path, "v1")
+    labels = {p["problem_label"] for p in matches["problems"]}
+    assert labels == {"알파벳은 아는데 영어 단어를 못 읽는다", "영어 강세 위치를 어떻게 아는가"}
+    assert len(matches["problems"]) == 2
+
+
+def test_get_video_matches_dedups_same_problem_from_multiple_queries(tmp_path):
+    """Two search queries under the same problem must not produce two problem entries."""
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        _seed_video(conn, "v1", "c1", "video 1")
+        _seed_match(conn, "v1", "reading", "영어 강세", "word_stress", "영어 강세 위치를 어떻게 아는가")
+        _seed_match(conn, "v1", "reading", "강세 규칙", "word_stress", "영어 강세 위치를 어떻게 아는가")
+
+    matches = get_video_matches(db_path, "v1")
+    assert len(matches["problems"]) == 1
+    assert matches["problems"][0]["problem_label"] == "영어 강세 위치를 어떻게 아는가"
+    # but both search queries are still both shown
+    assert set(matches["search_queries"]) == {"영어 강세", "강세 규칙"}
+
+
+def test_get_video_matches_search_queries_are_distinct(tmp_path):
+    # video_keyword_matches has a UNIQUE(video_id, category, search_query) constraint, so exact
+    # duplicate rows can't exist -- this confirms the query still returns each distinct query
+    # exactly once when several *different* queries are recorded.
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        _seed_video(conn, "v1", "c1", "video 1")
+        _seed_match(conn, "v1", "reading", "영어 강세", "word_stress", "label")
+        _seed_match(conn, "v1", "reading", "강세 규칙", "word_stress", "label")
+
+    matches = get_video_matches(db_path, "v1")
+    assert sorted(matches["search_queries"]) == sorted(["영어 강세", "강세 규칙"])
+    assert len(matches["search_queries"]) == len(set(matches["search_queries"]))
+
+
+def test_get_video_matches_single_match_still_works(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        _seed_video(conn, "v1", "c1", "video 1")
+        _seed_match(conn, "v1", "reading", "영어 단어 읽는 법", "cannot_read_words", "알파벳은 아는데 영어 단어를 못 읽는다")
+
+    matches = get_video_matches(db_path, "v1")
+    assert len(matches["problems"]) == 1
+    assert matches["search_queries"] == ["영어 단어 읽는 법"]
+
+
+def test_get_video_matches_no_match_returns_empty_lists(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        _seed_video(conn, "v1", "c1", "video 1")
+
+    matches = get_video_matches(db_path, "v1")
+    assert matches["problems"] == []
+    assert matches["search_queries"] == []
+
+
+def test_outlier_block_shows_multiple_matches_in_evergreen_and_category_sections(tmp_path):
+    """The same multi-match video must render identically (all problems/queries listed) whether
+    it's pulled via the global/evergreen query or the per-category query."""
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        _seed_video(conn, "v1", "c1", "multi-match video")
+        _seed_outlier(conn, "v1", score=80.0)
+        _seed_match(conn, "v1", "reading", "영어 단어 읽는 법", "cannot_read_words", "알파벳은 아는데 영어 단어를 못 읽는다")
+        _seed_match(conn, "v1", "reading", "영어 강세", "word_stress", "영어 강세 위치를 어떻게 아는가")
+
+    evergreen_rows = _fetch_top_rows(db_path, limit=10)
+    category_rows = _fetch_category_top_rows(db_path, "reading", limit=5)
+
+    evergreen_lines: list[str] = []
+    _write_outlier_block(db_path, evergreen_lines, evergreen_rows)
+    category_lines: list[str] = []
+    _write_outlier_block(db_path, category_lines, category_rows)
+
+    for lines in (evergreen_lines, category_lines):
+        text = "\n".join(lines)
+        assert "알파벳은 아는데 영어 단어를 못 읽는다" in text
+        assert "영어 강세 위치를 어떻게 아는가" in text
+        assert "영어 단어 읽는 법" in text
+        assert "영어 강세" in text

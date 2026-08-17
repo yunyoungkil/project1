@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from datetime import datetime
@@ -12,9 +13,25 @@ from research.config import load_config
 from research.content_pattern_analyzer import analyze_video
 from research.db import connect, init_db
 from research.gemini_client import GeminiClient
-from research.keyword_pool import add_keyword, iter_keywords, load_pool, sync_to_db
+from research.keyword_pool import add_keyword, iter_keywords, load_pool, resolve_legacy_problem, sync_to_db
 from research.my_channel import compute_topic_scores, sync_my_channel_stats
 from research.outlier_detector import DEFAULT_GRADE_THRESHOLDS
+from research.progress import (
+    log_error,
+    log_progress,
+    log_stage_done,
+    log_stage_start,
+    log_warning,
+    print_failure_summary,
+    print_run_summary,
+)
+from research.click_analysis import build_click_analysis_report
+from research.content_packages import build_content_packages_report
+from research.production_blueprint import build_production_blueprint_report
+from research.production_planner import build_production_plan_report
+from research.script_writer import build_script_report
+from research.topic_candidates import build_topic_candidates_report
+from research.video_director import build_video_direction_report
 from research.weekly_report import build_weekly_report
 from research.youtube_client import YouTubeClient
 from research.youtube_search import estimate_search_units, run_category_search
@@ -57,6 +74,37 @@ def _gemini_client(cfg) -> GeminiClient:
     )
 
 
+class _GeminiFailureCapture(logging.Handler):
+    """Listens for gemini_client's own "falling back to rule-based logic" warnings so the
+    PATTERNS loop can surface *which* item failed and why, without gemini_client.py needing to
+    know anything about progress reporting. Purely observational."""
+
+    def __init__(self):
+        super().__init__()
+        self.last_message: str | None = None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.last_message = record.getMessage()
+
+
+class _StageFailure(Exception):
+    def __init__(self, stage: str, cause: Exception):
+        super().__init__(str(cause))
+        self.stage = stage
+        self.cause = cause
+
+
+def _run_stage(stage: str, fn, stage_results: dict[str, str]):
+    try:
+        result = fn()
+        stage_results[stage] = "PASS"
+        return result
+    except Exception as e:  # noqa: BLE001 - re-raised as _StageFailure with stage context attached
+        stage_results[stage] = "FAIL"
+        log_error(f"{stage} 단계 실패", stage=stage, reason=str(e))
+        raise _StageFailure(stage, e) from e
+
+
 def cmd_auth(args, cfg):
     if not cfg.youtube_client_id or not cfg.youtube_client_secret:
         print("YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET must be set in .env", file=sys.stderr)
@@ -73,11 +121,28 @@ def cmd_keywords_list(args, cfg):
 
 
 def cmd_keywords_add(args, cfg):
-    add_keyword(cfg.keyword_pool_path, args.category, args.problem_id, args.problem_label, args.query)
-    print(f"Added '{args.query}' to category '{args.category}' / problem '{args.problem_id}'")
+    using_legacy = args.problem is not None
+    using_new = args.problem_id is not None or args.problem_label is not None
+
+    if using_legacy and using_new:
+        print("Use either --problem OR --problem-id/--problem-label, not both", file=sys.stderr)
+        sys.exit(1)
+
+    if using_legacy:
+        # Backward-compat path: old scripts only ever passed a natural-language --problem.
+        problem_id, problem_label = resolve_legacy_problem(cfg.keyword_pool_path, args.category, args.problem)
+    elif args.problem_id and args.problem_label:
+        problem_id, problem_label = args.problem_id, args.problem_label
+    else:
+        print("Provide --problem-id and --problem-label (or the legacy --problem)", file=sys.stderr)
+        sys.exit(1)
+
+    add_keyword(cfg.keyword_pool_path, args.category, problem_id, problem_label, args.query)
+    print(f"Added '{args.query}' to category '{args.category}' / problem '{problem_id}'")
 
 
 def cmd_search(args, cfg):
+    log_stage_start("SEARCH", args.category)
     yt = _require_youtube_client(cfg)
     cache_ttl_hours = cfg.get("search", "cache_ttl_hours", default=168)
     estimated = estimate_search_units(
@@ -99,9 +164,16 @@ def cmd_search(args, cfg):
         ambiguous_max_seconds=cfg.get("content_type", "ambiguous_max_seconds", default=180),
     )
     print(result)
+    log_stage_done(
+        "SEARCH",
+        f"{result['category']}\n  queries: {result['keywords_total']}\n  cached: {result['queries_cached']}"
+        f"\n  api calls: {result['queries_run']}\n  new videos: {result['new_video_count']}",
+    )
+    return result
 
 
 def cmd_analyze(args, cfg):
+    log_stage_start("ANALYZE")
     yt = _require_youtube_client(cfg)
     estimated = estimate_analyze_units(cfg.db_path, cache_ttl_hours=cfg.get("baseline", "cache_ttl_hours", default=168))
     print(f"[quota] estimated {estimated} unit(s) for this analyze run")
@@ -115,8 +187,16 @@ def cmd_analyze(args, cfg):
         score_caps=cfg.get("opportunity_score", "caps", default={}),
         neutral_score=cfg.get("opportunity_score", "neutral_score_when_missing", default=50),
         min_grade_to_store=cfg.get("outlier", "min_grade_to_store", default="notable"),
+        on_progress=lambda i, total: log_progress("ANALYZE", i, total),
     )
     print(result)
+    log_stage_done(
+        "ANALYZE",
+        f"total={result['total_candidates']} processed={result['processed']}"
+        f" unknown_type={result['skipped_unknown_type']} no_baseline={result['skipped_no_baseline']}"
+        f" below_threshold={result['skipped_below_threshold']}",
+    )
+    return result
 
 
 TOP_VIDEO_QUERY = """
@@ -172,37 +252,68 @@ def cmd_patterns(args, cfg):
             """
         ).fetchall()
 
-    for r in rows:
-        pattern = analyze_video(
-            r["video_id"], r["title"], gemini, max_output_tokens=cfg.get("gemini", "max_output_tokens", default=1024)
-        )
-        with connect(cfg.db_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO content_patterns (video_id, viewer_problem, title_pattern, hook, promise,
-                    emotion, beginner_appeal, primary_archetype, secondary_archetype, is_question,
-                    is_negative, is_reason, is_result, is_number, is_fear_avoidance, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(video_id) DO UPDATE SET
-                    viewer_problem=excluded.viewer_problem, title_pattern=excluded.title_pattern,
-                    hook=excluded.hook, promise=excluded.promise, emotion=excluded.emotion,
-                    beginner_appeal=excluded.beginner_appeal, primary_archetype=excluded.primary_archetype,
-                    secondary_archetype=excluded.secondary_archetype, is_question=excluded.is_question,
-                    is_negative=excluded.is_negative, is_reason=excluded.is_reason,
-                    is_result=excluded.is_result, is_number=excluded.is_number,
-                    is_fear_avoidance=excluded.is_fear_avoidance, source=excluded.source,
-                    computed_at=datetime('now')
-                """,
-                (
-                    r["video_id"], pattern.viewer_problem, pattern.title_pattern, pattern.hook,
-                    pattern.promise, pattern.emotion, pattern.beginner_appeal,
-                    pattern.primary_archetype, pattern.secondary_archetype,
-                    pattern.flags.is_question, pattern.flags.is_negative,
-                    pattern.flags.is_reason, pattern.flags.is_result, pattern.flags.is_number,
-                    pattern.flags.is_fear_avoidance, pattern.source,
-                ),
+    total = len(rows)
+    log_stage_start("PATTERNS", f"{total}개 영상 제목 패턴 분석")
+
+    # Listens for gemini_client's own logging output so a failed call can be reported as
+    # "[WARN] ... (i/total)" without content_pattern_analyzer.py needing to know about progress.
+    failure_capture = _GeminiFailureCapture()
+    gemini_logger = logging.getLogger("research.gemini_client")
+    gemini_logger.addHandler(failure_capture)
+
+    gemini_success = 0
+    fallback = 0
+    try:
+        for i, r in enumerate(rows, start=1):
+            failure_capture.last_message = None
+            pattern = analyze_video(
+                r["video_id"], r["title"], gemini, max_output_tokens=cfg.get("gemini", "max_output_tokens", default=1024)
             )
 
+            if gemini.available and failure_capture.last_message:
+                fallback += 1
+                log_warning(
+                    f"Gemini 분석 실패 ({i}/{total})",
+                    reason=failure_capture.last_message,
+                    fallback="rule-based",
+                    pipeline="continues",
+                )
+            elif pattern.source == "gemini":
+                gemini_success += 1
+
+            with connect(cfg.db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO content_patterns (video_id, viewer_problem, title_pattern, hook, promise,
+                        emotion, beginner_appeal, primary_archetype, secondary_archetype, is_question,
+                        is_negative, is_reason, is_result, is_number, is_fear_avoidance, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(video_id) DO UPDATE SET
+                        viewer_problem=excluded.viewer_problem, title_pattern=excluded.title_pattern,
+                        hook=excluded.hook, promise=excluded.promise, emotion=excluded.emotion,
+                        beginner_appeal=excluded.beginner_appeal, primary_archetype=excluded.primary_archetype,
+                        secondary_archetype=excluded.secondary_archetype, is_question=excluded.is_question,
+                        is_negative=excluded.is_negative, is_reason=excluded.is_reason,
+                        is_result=excluded.is_result, is_number=excluded.is_number,
+                        is_fear_avoidance=excluded.is_fear_avoidance, source=excluded.source,
+                        computed_at=datetime('now')
+                    """,
+                    (
+                        r["video_id"], pattern.viewer_problem, pattern.title_pattern, pattern.hook,
+                        pattern.promise, pattern.emotion, pattern.beginner_appeal,
+                        pattern.primary_archetype, pattern.secondary_archetype,
+                        pattern.flags.is_question, pattern.flags.is_negative,
+                        pattern.flags.is_reason, pattern.flags.is_result, pattern.flags.is_number,
+                        pattern.flags.is_fear_avoidance, pattern.source,
+                    ),
+                )
+            log_progress("PATTERNS", i, total)
+    finally:
+        gemini_logger.removeHandler(failure_capture)
+
+    log_stage_done("PATTERNS", f"total={total} gemini_success={gemini_success} fallback={fallback}")
+
+    log_stage_start("CHANNEL", "내 채널 Analytics 동기화")
     yt = _require_youtube_client(cfg)
     my_stats = sync_my_channel_stats(
         cfg.db_path, cfg.youtube_client_id, cfg.youtube_client_secret, cfg.oauth_token_path, yt,
@@ -210,7 +321,9 @@ def cmd_patterns(args, cfg):
         traffic_source_top_n=cfg.get("my_channel", "traffic_source_top_n", default=20),
     )
     print("my_channel_stats:", my_stats)
+    log_stage_done("CHANNEL", str(my_stats))
 
+    log_stage_start("TOPIC", "topic score 계산")
     topics = compute_topic_scores(
         cfg.db_path,
         cfg.keyword_pool_path,
@@ -222,9 +335,19 @@ def cmd_patterns(args, cfg):
     )
     for t in topics:
         print(t)
+    log_stage_done("TOPIC", f"{len(topics)}개 카테고리")
+
+    return {
+        "patterns_total": total,
+        "gemini_success": gemini_success,
+        "fallback": fallback,
+        "my_channel_stats": my_stats,
+        "topics": topics,
+    }
 
 
 def cmd_report_weekly(args, cfg):
+    log_stage_start("REPORT", "주간 리포트 생성")
     gemini = _gemini_client(cfg)
     path = build_weekly_report(
         cfg.db_path,
@@ -235,6 +358,124 @@ def cmd_report_weekly(args, cfg):
         max_output_tokens=cfg.get("gemini", "max_output_tokens", default=1024),
     )
     print(f"Report written to {path}")
+    log_stage_done("REPORT", str(path))
+    return path
+
+
+def cmd_topics(args, cfg):
+    log_stage_start("TOPICS", "viewer problem 기반 topic candidate 생성 (신규 API 호출 없음)")
+    gemini = _gemini_client(cfg)
+    path = build_topic_candidates_report(
+        cfg.db_path,
+        cfg.reports_dir,
+        gemini,
+        cfg.keyword_pool_path,
+        top_n=args.top,
+        fit_neutral_score=cfg.get("topic_score", "fit_neutral_score", default=50),
+        max_output_tokens=cfg.get("gemini", "max_output_tokens", default=1024),
+    )
+    print(f"Topic candidates report written to {path}")
+    log_stage_done("TOPICS", str(path))
+    return path
+
+
+def cmd_clicks(args, cfg):
+    log_stage_start("CLICKS", "topic candidate의 대표 outlier 클릭 이유 분석 (신규 API 호출 없음)")
+    gemini = _gemini_client(cfg)
+    path = build_click_analysis_report(
+        cfg.db_path,
+        cfg.reports_dir,
+        gemini,
+        top_n=args.top,
+        max_output_tokens=cfg.get("gemini", "max_output_tokens", default=1024),
+    )
+    print(f"Click analysis report written to {path}")
+    log_stage_done("CLICKS", str(path))
+    return path
+
+
+def cmd_packages(args, cfg):
+    log_stage_start("PACKAGES", "06 후보의 제목x썸네일 패키지 생성 (신규 API 호출 없음)")
+    gemini = _gemini_client(cfg)
+    path = build_content_packages_report(
+        cfg.db_path,
+        cfg.reports_dir,
+        gemini,
+        cfg.get("channel", default={}),
+        top_n=args.top,
+        max_output_tokens=cfg.get("gemini", "max_output_tokens_packages", default=3000),
+    )
+    print(f"Content packages report written to {path}")
+    log_stage_done("PACKAGES", str(path))
+    return path
+
+
+def cmd_blueprint(args, cfg):
+    log_stage_start("BLUEPRINT", "07 선정 Package의 영상 제작 설계 생성 (신규 API 호출 없음)")
+    gemini = _gemini_client(cfg)
+    path = build_production_blueprint_report(
+        cfg.db_path,
+        cfg.reports_dir,
+        gemini,
+        cfg.get("channel", default={}),
+        package_id=args.package_id,
+        max_output_tokens=cfg.get("gemini", "max_output_tokens_blueprint", default=6000),
+    )
+    print(f"Production blueprint report written to {path}")
+    log_stage_done("BLUEPRINT", str(path))
+    return path
+
+
+def cmd_script(args, cfg):
+    log_stage_start("SCRIPT", "08 Blueprint의 촬영용 대본 생성 (신규 API 호출 없음)")
+    gemini = _gemini_client(cfg)
+    path = build_script_report(
+        cfg.db_path,
+        cfg.reports_dir,
+        gemini,
+        cfg.get("channel", default={}),
+        blueprint_id=args.blueprint_id,
+        max_output_tokens=cfg.get("gemini", "max_output_tokens_script", default=8000),
+    )
+    print(f"Script report written to {path}")
+    log_stage_done("SCRIPT", str(path))
+    return path
+
+
+def cmd_direction(args, cfg):
+    log_stage_start("DIRECTION", "09 Content Script의 영상 포맷/연출 방향 결정 (신규 API 호출 없음)")
+    gemini = _gemini_client(cfg)
+    transcript_segments = None
+    if args.transcript_json:
+        with open(args.transcript_json, "r", encoding="utf-8") as f:
+            transcript_segments = json.load(f)
+    path = build_video_direction_report(
+        cfg.db_path,
+        cfg.reports_dir,
+        gemini,
+        cfg.get("channel", default={}),
+        cfg.get("clip_score", default={}),
+        script_id=args.script_id,
+        transcript_segments=transcript_segments,
+        max_output_tokens=cfg.get("gemini", "max_output_tokens_direction", default=6000),
+    )
+    print(f"Video direction report written to {path}")
+    log_stage_done("DIRECTION", str(path))
+    return path
+
+
+def cmd_production_plan(args, cfg):
+    log_stage_start("PRODUCTION-PLAN", "10 Video Direction의 제작 명세 컴파일 (신규 API 호출 없음)")
+    path = build_production_plan_report(
+        cfg.db_path,
+        cfg.reports_dir,
+        direction_id=args.direction_id,
+        clip_config=cfg.get("clip_score", default={}),
+        complexity_config=cfg.get("production_planner", "complexity_thresholds", default={}),
+    )
+    print(f"Production plan report written to {path}")
+    log_stage_done("PRODUCTION-PLAN", str(path))
+    return path
 
 
 def cmd_run_scheduled(args, cfg):
@@ -255,14 +496,41 @@ def cmd_run_scheduled(args, cfg):
 
 
 def cmd_run_all(args, cfg):
-    pool = load_pool(cfg.keyword_pool_path)
-    for category in pool:
-        args.category = category
-        args.query_limit = args.query_limit
-        cmd_search(args, cfg)
-    cmd_analyze(args, cfg)
-    cmd_patterns(args, cfg)
-    cmd_report_weekly(args, cfg)
+    log_stage_start("START", "전체 파이프라인 실행")
+    stage_results: dict[str, str] = {}
+    quota_start = _total_quota_used(cfg.db_path)
+    report_path = None
+
+    def _search_all():
+        pool = load_pool(cfg.keyword_pool_path)
+        for category in pool:
+            args.category = category
+            cmd_search(args, cfg)
+
+    try:
+        _run_stage("Search", _search_all, stage_results)
+        _run_stage("Analyze", lambda: cmd_analyze(args, cfg), stage_results)
+        patterns_result = _run_stage("Patterns", lambda: cmd_patterns(args, cfg), stage_results)
+        # Channel sync + topic score run inside cmd_patterns (see [CHANNEL]/[TOPIC] stage logs
+        # above) -- they succeeded if Patterns did, since any failure there would already have
+        # raised out of cmd_patterns and been caught as a Patterns failure.
+        stage_results["Channel Sync"] = "PASS"
+        stage_results["Topic Score"] = "PASS"
+        report_path = _run_stage("Report", lambda: cmd_report_weekly(args, cfg), stage_results)
+    except _StageFailure as failure:
+        print_failure_summary(failed_stage=failure.stage.upper(), reason=str(failure.cause), stage_results=stage_results)
+        raise failure.cause from None
+
+    fallback_count = (patterns_result or {}).get("fallback", 0)
+    quota_used = _total_quota_used(cfg.db_path) - quota_start
+    log_stage_done("DONE", "전체 파이프라인 완료")
+    print_run_summary(
+        stage_results=stage_results,
+        report_path=report_path,
+        quota_used=quota_used,
+        warning_count=fallback_count,
+        success=True,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -276,8 +544,9 @@ def build_parser() -> argparse.ArgumentParser:
     kw_sub.add_parser("list").set_defaults(func=cmd_keywords_list)
     kw_add = kw_sub.add_parser("add")
     kw_add.add_argument("--category", required=True)
-    kw_add.add_argument("--problem-id", required=True, help="Short stable id, e.g. 'word_stress'")
-    kw_add.add_argument("--problem-label", required=True, help="Natural-language viewer problem")
+    kw_add.add_argument("--problem-id", default=None, help="Short stable id, e.g. 'word_stress'")
+    kw_add.add_argument("--problem-label", default=None, help="Natural-language viewer problem")
+    kw_add.add_argument("--problem", default=None, help="Deprecated alias for --problem-label; resolves/generates a problem_id automatically")
     kw_add.add_argument("--query", required=True)
     kw_add.set_defaults(func=cmd_keywords_add)
 
@@ -297,6 +566,35 @@ def build_parser() -> argparse.ArgumentParser:
     report = sub.add_parser("report", help="Generate a report")
     report_sub = report.add_subparsers(dest="report_command", required=True)
     report_sub.add_parser("weekly").set_defaults(func=cmd_report_weekly)
+
+    topics = sub.add_parser("topics", help="Generate ranked topic candidates from viewer problems (no new API calls)")
+    topics.add_argument("--top", type=int, default=20)
+    topics.set_defaults(func=cmd_topics)
+
+    clicks = sub.add_parser("clicks", help="Analyze why the shortlisted topics' outlier videos got clicked (no new API calls)")
+    clicks.add_argument("--top", type=int, default=10)
+    clicks.set_defaults(func=cmd_clicks)
+
+    packages = sub.add_parser("packages", help="Generate title x thumbnail packages for the 06-selected topics (no new API calls)")
+    packages.add_argument("--top", type=int, default=10)
+    packages.set_defaults(func=cmd_packages)
+
+    blueprint = sub.add_parser("blueprint", help="Generate a production blueprint for the 07-selected package (no new API calls)")
+    blueprint.add_argument("--package-id", type=int, default=None, help="Use a specific content_packages id instead of the top selected_for_production package")
+    blueprint.set_defaults(func=cmd_blueprint)
+
+    script = sub.add_parser("script", help="Generate a shootable script for the 08-selected blueprint (no new API calls)")
+    script.add_argument("--blueprint-id", type=int, default=None, help="Use a specific production_blueprints id instead of the latest ready_for_script blueprint")
+    script.set_defaults(func=cmd_script)
+
+    direction = sub.add_parser("direction", help="Decide the video format and per-block direction for the 09-selected Content Script (no new API calls)")
+    direction.add_argument("--script-id", type=int, default=None, help="Use a specific video_scripts id instead of the latest ready_for_direction script")
+    direction.add_argument("--transcript-json", type=str, default=None, help="Path to a JSON file of transcript segments ([{start,end,text,audio_quality?,source_ref?}, ...]) for the Source Clip Analyzer; omit if no source video is available")
+    direction.set_defaults(func=cmd_direction)
+
+    production_plan = sub.add_parser("production-plan", help="Compile the 10-selected Video Direction into a Production Plan (no new API calls)")
+    production_plan.add_argument("--direction-id", type=int, default=None, help="Use a specific video_directions id instead of the latest ready_for_production_planning direction")
+    production_plan.set_defaults(func=cmd_production_plan)
 
     sub.add_parser("run-scheduled", help="Run today's scheduled task from config").set_defaults(func=cmd_run_scheduled)
 

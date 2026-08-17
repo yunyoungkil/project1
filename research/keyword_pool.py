@@ -6,6 +6,7 @@ guess -- see youtube_search.py, which threads problem_id/problem_label through u
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -75,6 +76,27 @@ def sync_to_db(db_path: Path, pool: dict[str, dict]) -> int:
             )
             count += 1
     return count
+
+
+def _slugify_problem_label(label: str) -> str:
+    """Deterministic id for a problem introduced with only a natural-language label (the legacy
+    `keywords add --problem` CLI path, before problem_id existed). Same label always yields the
+    same id, so re-running the command with the same --problem doesn't create a second problem
+    entry. Not meant to be human-friendly -- just stable and collision-safe."""
+    digest = hashlib.sha1(label.strip().encode("utf-8")).hexdigest()[:10]
+    return f"legacy_{digest}"
+
+
+def resolve_legacy_problem(path: Path, category: str, problem_label: str) -> tuple[str, str]:
+    """Backward-compat helper for `research keywords add --problem <label>` (pre-problem_id CLI
+    usage). Reuses the id of an existing problem with the same label in that category if one
+    exists, otherwise derives a new deterministic id -- never invents a second entry for a label
+    that's already there."""
+    pool = load_pool(path)
+    for problem in problems_for_category(pool, category):
+        if problem.get("label") == problem_label:
+            return problem["id"], problem_label
+    return _slugify_problem_label(problem_label), problem_label
 
 
 def add_keyword(path: Path, category: str, problem_id: str, problem_label: str, search_query: str) -> None:

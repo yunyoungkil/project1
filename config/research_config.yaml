@@ -70,6 +70,51 @@ gemini:
   model: gemini-flash-latest
   timeout_seconds: 30
   max_output_tokens: 1024
+  # `research packages` asks for a 5-item JSON array (title/thumbnail/angle/driver per item) in a
+  # single call, which needs much more room than the single-object prompts other stages use.
+  max_output_tokens_packages: 3000
+  # `research blueprint` asks for one large nested structure (viewer contract, sections, example
+  # ladder, hook, shorts candidates, etc.) in a single call -- needs even more room.
+  max_output_tokens_blueprint: 6000
+  # `research script` asks for full Korean narration text plus 09-2/09-3 Content Block metadata
+  # (learning_function, required_content, retention_intent, 8-signal media_affinity, etc.) for
+  # every section plus opening/mini success/ending in one call -- the largest single response in
+  # the pipeline; 8000 truncated mid-response once the per-block metadata was added.
+  max_output_tokens_script: 12000
+  # `research direction` only asks for a short 3-gate judgment (podcast/clip/explanation
+  # necessity) or, for PODCAST, a dialogue-beat script -- comparable to the blueprint prompt.
+  max_output_tokens_direction: 6000
+
+clip_score:
+  weights:
+    learning_match: 0.30
+    phenomenon_clarity: 0.25
+    replay_value: 0.20
+    context_independence: 0.15
+    audio_usability: 0.10
+  grade_thresholds:
+    strong: 85
+    good: 70
+    usable: 55
+  # candidates scoring below this on learning_match alone are hard-excluded (spec: "분석 대상
+  # 발화를 특정할 수 없음"), everything else is kept and soft-scored instead.
+  min_learning_match_to_keep: 10
+  # segment length sweet spot for replay_value -- too short feels abrupt, too long is hard to
+  # loop; both ends taper off rather than hard-cutting.
+  replay_ideal_seconds: [2, 6]
+  # audio_usability when a transcript segment doesn't carry its own audio_quality hint -- real
+  # audio QC isn't implemented, so this stays a documented neutral placeholder, not a real signal.
+  neutral_audio_quality: 65
+  # context padding added around a focus segment when building the CONTEXT clip boundary.
+  context_padding_seconds: 2.0
+
+production_planner:
+  # speech/clip/replay/interaction/visual-type signal counts above these totals bump Production
+  # Complexity up a level (spec section 33) -- thresholds live here instead of scattered magic
+  # numbers in code.
+  complexity_thresholds:
+    medium_at_total_signals: 12
+    high_at_total_signals: 22
 
 my_channel:
   lookback_days: 90

@@ -173,6 +173,273 @@ CREATE TABLE IF NOT EXISTS weekly_reports (
     file_path TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS topic_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    report_path TEXT,
+    category TEXT NOT NULL,
+    problem_id TEXT NOT NULL,
+    problem_label TEXT NOT NULL,
+    topic_text TEXT NOT NULL,
+    cluster_id INTEGER NOT NULL,
+    is_cluster_representative INTEGER NOT NULL DEFAULT 1,
+    recommended_format TEXT NOT NULL,
+    evidence_quality TEXT NOT NULL,
+    topic_candidate_score REAL NOT NULL,
+    market_demand_score REAL,
+    my_channel_fit_score REAL,
+    matched_video_count INTEGER NOT NULL,
+    outlier_video_count INTEGER NOT NULL,
+    representative_video_id TEXT,
+    representative_outlier_ratio REAL,
+    shortlisted INTEGER NOT NULL DEFAULT 0,
+    shortlist_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS click_analysis_videos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    report_path TEXT,
+    category TEXT NOT NULL,
+    problem_id TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    content_type TEXT,
+    evidence_quality TEXT NOT NULL,
+    viewer_problem_at_click TEXT,
+    title_hook TEXT,
+    title_promise TEXT,
+    has_curiosity_gap INTEGER,
+    specificity TEXT,
+    emotion TEXT,
+    devices_json TEXT,
+    primary_click_driver TEXT NOT NULL,
+    secondary_click_driver TEXT,
+    source TEXT NOT NULL DEFAULT 'rule'
+);
+
+CREATE TABLE IF NOT EXISTS click_analysis_topics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    report_path TEXT,
+    category TEXT NOT NULL,
+    problem_id TEXT NOT NULL,
+    topic_text TEXT NOT NULL,
+    topic_candidate_score REAL,
+    click_evidence_score REAL NOT NULL,
+    combined_signal REAL,
+    brand_fit TEXT NOT NULL,
+    representative_video_count INTEGER NOT NULL,
+    repeated_click_drivers_json TEXT,
+    thumbnail_data_status TEXT NOT NULL DEFAULT 'unavailable',
+    hook_data_status TEXT NOT NULL DEFAULT 'unavailable',
+    selected_for_next_stage INTEGER NOT NULL DEFAULT 0,
+    selection_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS content_packages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    report_path TEXT,
+    category TEXT NOT NULL,
+    problem_id TEXT NOT NULL,
+    topic_text TEXT NOT NULL,
+    is_comparison_candidate INTEGER NOT NULL DEFAULT 0,
+    title TEXT NOT NULL,
+    thumbnail_text TEXT NOT NULL,
+    visual_focus TEXT,
+    layout TEXT,
+    example_word TEXT,
+    highlight_element TEXT,
+    primary_angle TEXT NOT NULL,
+    secondary_angle TEXT,
+    primary_click_driver TEXT NOT NULL,
+    title_thumbnail_relationship TEXT NOT NULL,
+    brand_fit TEXT NOT NULL,
+    copy_risk TEXT NOT NULL,
+    exaggeration_penalty REAL NOT NULL DEFAULT 0,
+    package_score REAL NOT NULL,
+    topic_candidate_score REAL,
+    click_evidence_score REAL,
+    excluded_reason TEXT,
+    selected_for_production INTEGER NOT NULL DEFAULT 0,
+    production_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS production_blueprints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    report_path TEXT,
+    package_id INTEGER,
+    category TEXT NOT NULL,
+    problem_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    thumbnail_text TEXT NOT NULL,
+    viewer_problem TEXT,
+    click_expectation TEXT,
+    video_promise TEXT,
+    expected_transformation TEXT,
+    core_question TEXT NOT NULL,
+    core_answer TEXT NOT NULL,
+    learning_objectives_json TEXT,
+    scope_in_json TEXT,
+    scope_out_json TEXT,
+    prerequisite_level TEXT,
+    hook_json TEXT,
+    sections_json TEXT,
+    example_ladder_json TEXT,
+    mini_success_json TEXT,
+    audio_visual_json TEXT,
+    shorts_candidates_json TEXT,
+    natural_next_topics_json TEXT,
+    external_clip_needed INTEGER NOT NULL DEFAULT 0,
+    clip_purpose TEXT,
+    promise_feasibility TEXT NOT NULL,
+    promise_risk_reason TEXT,
+    brand_design_fit TEXT NOT NULL,
+    brand_fit_reason TEXT,
+    integrity_check_json TEXT,
+    production_complexity TEXT NOT NULL,
+    blueprint_score REAL NOT NULL,
+    ready_for_script INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS video_scripts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    report_path TEXT,
+    blueprint_id INTEGER,
+    package_id INTEGER,
+    topic_candidate_id INTEGER,
+    title TEXT NOT NULL,
+    thumbnail_text TEXT NOT NULL,
+    viewer_problem TEXT,
+    video_promise TEXT,
+    expected_transformation TEXT,
+    core_question TEXT NOT NULL,
+    core_answer TEXT NOT NULL,
+    script_json TEXT NOT NULL,
+    script_text TEXT NOT NULL,
+    estimated_duration_seconds REAL NOT NULL,
+    estimated_word_count INTEGER NOT NULL,
+    hook_score REAL NOT NULL,
+    clarity_score REAL NOT NULL,
+    scope_alignment_score REAL NOT NULL,
+    example_alignment_score REAL NOT NULL,
+    audio_first_score REAL NOT NULL,
+    retention_score REAL NOT NULL,
+    script_score REAL NOT NULL,
+    integrity_json TEXT NOT NULL,
+    ready_for_production INTEGER NOT NULL DEFAULT 0,
+    generation_method TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS video_directions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    report_path TEXT,
+    video_script_id INTEGER NOT NULL,
+    preferred_format TEXT NOT NULL,
+    final_format TEXT NOT NULL,
+    format_confidence TEXT NOT NULL,
+    format_reason_json TEXT,
+    clip_dependency TEXT NOT NULL,
+    fallback_format TEXT,
+    final_format_status TEXT NOT NULL,
+    director_score REAL,
+    integrity_json TEXT NOT NULL,
+    ready_for_production_planning INTEGER NOT NULL DEFAULT 0,
+    generation_method TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS block_directions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_direction_id INTEGER NOT NULL,
+    content_block_id TEXT NOT NULL,
+    delivery_mode TEXT NOT NULL,
+    production_intent TEXT,
+    viewer_interaction_json TEXT,
+    audio_requirement_json TEXT,
+    visual_requirement_json TEXT,
+    clip_requirement_json TEXT,
+    retention_role_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS source_clip_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_direction_id INTEGER NOT NULL,
+    content_block_id TEXT NOT NULL,
+    source_ref TEXT,
+    transcript TEXT,
+    focus_in REAL NOT NULL,
+    focus_out REAL NOT NULL,
+    context_in REAL NOT NULL,
+    context_out REAL NOT NULL,
+    learning_match REAL NOT NULL,
+    phenomenon_clarity REAL NOT NULL,
+    replay_value REAL NOT NULL,
+    context_independence REAL NOT NULL,
+    audio_usability REAL NOT NULL,
+    clip_score REAL NOT NULL,
+    clip_grade TEXT NOT NULL,
+    clip_role TEXT NOT NULL,
+    confidence TEXT,
+    selected INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS production_plans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    report_path TEXT,
+    video_direction_id INTEGER NOT NULL,
+    video_script_id INTEGER NOT NULL,
+    final_format TEXT NOT NULL,
+    plan_json TEXT NOT NULL,
+    estimated_duration_seconds REAL NOT NULL,
+    production_complexity TEXT NOT NULL,
+    generation_method TEXT NOT NULL,
+    integrity_check_json TEXT NOT NULL,
+    planner_score REAL,
+    ready_for_asset_generation INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS production_blocks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    production_plan_id INTEGER NOT NULL,
+    content_block_id TEXT NOT NULL,
+    block_order INTEGER NOT NULL,
+    delivery_mode TEXT NOT NULL,
+    production_intent TEXT,
+    timeline_spec_json TEXT NOT NULL,
+    speech_segments_json TEXT NOT NULL,
+    visual_spec_json TEXT NOT NULL,
+    caption_spec_json TEXT NOT NULL,
+    clip_spec_json TEXT,
+    interaction_spec_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS speech_assets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    production_plan_id INTEGER NOT NULL,
+    content_block_id TEXT NOT NULL,
+    speech_asset_id TEXT NOT NULL,
+    speech_mode TEXT NOT NULL,
+    voice_name TEXT,
+    language_code TEXT,
+    source_text TEXT NOT NULL,
+    tts_input_text TEXT,
+    display_text TEXT,
+    expected_pronunciation TEXT,
+    approximation_only INTEGER NOT NULL DEFAULT 0,
+    source_clip_candidate_id INTEGER,
+    pause_before_ms INTEGER NOT NULL DEFAULT 0,
+    pause_after_ms INTEGER NOT NULL DEFAULT 0,
+    replay_group TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS api_call_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     endpoint TEXT NOT NULL,
@@ -204,6 +471,12 @@ _COLUMN_MIGRATIONS = [
     ("topic_opportunities", "market_evidence_status", "TEXT NOT NULL DEFAULT 'sufficient'"),
     ("topic_opportunities", "candidate_video_count", "INTEGER NOT NULL DEFAULT 0"),
     ("topic_opportunities", "evidence_confidence", "TEXT NOT NULL DEFAULT 'low'"),
+    ("video_scripts", "content_blocks_json", "TEXT"),
+    ("video_scripts", "ready_for_direction", "INTEGER"),
+    # 10 computed PODCAST dialogue beats in-memory but never persisted them, so 11 (which reads
+    # video_directions/block_directions/source_clip_candidates as its base input per its own spec)
+    # had no queryable way to consume a PODCAST direction from the DB. Purely additive.
+    ("video_directions", "podcast_direction_json", "TEXT"),
 ]
 
 

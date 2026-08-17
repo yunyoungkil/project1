@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Callable
 
 from research.channel_baseline import compute_channel_baseline, has_fresh_baseline
 from research.db import connect
@@ -64,14 +65,19 @@ def analyze_pending_videos(
     score_caps: dict,
     neutral_score: float = 50.0,
     min_grade_to_store: str = "notable",
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> dict:
     videos = _fetch_pending_videos(db_path)
+    total = len(videos)
     processed = 0
     skipped_unknown_type = 0
     skipped_no_baseline = 0
     skipped_below_threshold = 0
 
-    for v in videos:
+    for i, v in enumerate(videos, start=1):
+        if on_progress:
+            on_progress(i, total)
+
         if v["content_type"] == "unknown":
             skipped_unknown_type += 1
             continue
