@@ -48,6 +48,8 @@ class ContentPattern:
     title_pattern: str | None = None
     hook: str | None = None
     promise: str | None = None
+    emotion: str | None = None
+    beginner_appeal: str | None = None
     source: str = "rule"
 
 
@@ -59,7 +61,9 @@ _GEMINI_PROMPT_TEMPLATE = """다음은 한국 영어교육 YouTube 영상의 제
   "viewer_problem": "이 영상이 다루는 시청자의 실제 고민 (한 문장)",
   "title_pattern": "제목의 구조 패턴 (예: 문제+이유, 질문형, 결과형 등)",
   "hook": "제목이 만드는 호기심/궁금증 포인트 (한 문장)",
-  "promise": "시청자에게 약속하는 결과 (한 문장)"
+  "promise": "시청자에게 약속하는 결과 (한 문장)",
+  "emotion": "제목이 건드리는 시청자의 감정 (예: 답답함, 불안, 안도감 등, 한 단어~구)",
+  "beginner_appeal": "이 제목이 왕초보 시청자에게 매력적인 이유 (한 문장)"
 }}
 """
 
@@ -75,6 +79,8 @@ def analyze_video(video_id: str, title: str, gemini: GeminiClient | None, max_ou
             pattern.title_pattern = result.get("title_pattern")
             pattern.hook = result.get("hook")
             pattern.promise = result.get("promise")
+            pattern.emotion = result.get("emotion")
+            pattern.beginner_appeal = result.get("beginner_appeal")
             pattern.source = "gemini"
 
     return pattern

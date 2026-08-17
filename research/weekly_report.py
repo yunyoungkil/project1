@@ -35,15 +35,15 @@ _TOP3_PROMPT_TEMPLATE = """너는 한국 YouTube 채널 "{channel_name}"의 콘�
 """
 
 
-def _fallback_top3_content(category: str) -> dict:
+def _fallback_top3_content(problem_phrase: str) -> dict:
     return {
         "titles": [
-            f"{category} 문제, 원리부터 이해하면 쉬워집니다",
-            f"왜 {category}가 안 될까? 진짜 이유",
-            f"{category} 처음부터 다시 이해하기",
+            f"{problem_phrase}, 원리로 이해하면 쉬워집니다",
+            f"{problem_phrase} - 진짜 이유부터 짚어드립니다",
+            f"{problem_phrase}, 처음부터 다시 정리해드립니다",
         ],
-        "thumbnail_phrases": [f"{category} 이제 이해된다", "이유를 알면 쉬워요"],
-        "shorts_ideas": [f"{category} 핵심 원리 60초 요약"],
+        "thumbnail_phrases": ["이제 이해가 됩니다", "원리를 알면 쉬워요"],
+        "shorts_ideas": [f"{problem_phrase}, 60초 핵심 요약"],
     }
 
 
@@ -66,6 +66,13 @@ def build_weekly_report(
     # 시작해야 하나") for display; falls back to the slug itself if a category has no problems.
     category_labels = {
         category: (body.get("problems") or [category])[0] for category, body in pool.items()
+    }
+    # category slug -> the *set* of all its problem phrases. Each video's problem_category is now
+    # the single best-matching problem within its category (see youtube_search.best_matching_problem),
+    # not always the category's first/"primary" problem -- so matching a topic back to its videos
+    # has to check membership in the whole set, not equality against one label.
+    category_problem_sets = {
+        category: set(body.get("problems") or [category]) for category, body in pool.items()
     }
 
     with connect(db_path) as conn:
@@ -123,6 +130,8 @@ def build_weekly_report(
         lines.append(f"   - Opportunity: {_fmt(r.get('opportunity_score'))}/100")
         lines.append(f"   - Viewer problem: {r.get('problem_category') or '-'}")
         lines.append(f"   - Title pattern: {p.title_pattern or '(rule-based flags only)'}")
+        if p.emotion:
+            lines.append(f"   - Emotion: {p.emotion}")
         lines.append(f"   - Video: https://www.youtube.com/watch?v={r['video_id']}")
         lines.append("")
 
@@ -161,7 +170,8 @@ def build_weekly_report(
     for i, t in enumerate(topic_rows[:top3_n], start=1):
         evidence = json.loads(t["evidence_json"]) if t.get("evidence_json") else {}
         problem_phrase = category_labels.get(t["problem_category"], t["problem_category"])
-        matched_rows = [r for r in top_rows if r.get("problem_category") == problem_phrase]
+        problem_set = category_problem_sets.get(t["problem_category"], {problem_phrase})
+        matched_rows = [r for r in top_rows if r.get("problem_category") in problem_set]
         sample_titles = [r["title"] for r in matched_rows][:3]
         representative_outlier_ratios = [r["outlier_ratio"] for r in matched_rows if r.get("outlier_ratio") is not None]
         representative_outlier_ratio = max(representative_outlier_ratios) if representative_outlier_ratios else None
@@ -185,9 +195,10 @@ def build_weekly_report(
         lines.append(f"### #{i}")
         lines.append(f"주제: {problem_phrase}")
         lines.append("")
+        ratio_str = f"{_fmt(representative_outlier_ratio)}X" if representative_outlier_ratio is not None else "-"
         lines.append(
             f"시장 근거: outlier 영상 {evidence.get('outlier_video_count', 0)}개, "
-            f"대표 Outlier Ratio {_fmt(representative_outlier_ratio)}X, "
+            f"대표 Outlier Ratio {ratio_str}, "
             f"종합 opportunity {_fmt(t['content_opportunity_score'])}"
         )
         lines.append(f"내 채널 근거: fit score {_fmt(t['my_channel_fit_score'])}"

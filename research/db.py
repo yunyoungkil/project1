@@ -65,6 +65,18 @@ CREATE TABLE IF NOT EXISTS videos (
     last_updated_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS video_metrics_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id TEXT NOT NULL,
+    snapshot_at TEXT NOT NULL DEFAULT (datetime('now')),
+    view_count INTEGER,
+    like_count INTEGER,
+    comment_count INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_video_metrics_snapshots_video_id
+    ON video_metrics_snapshots (video_id, snapshot_at);
+
 CREATE TABLE IF NOT EXISTS video_keyword_matches (
     video_id TEXT NOT NULL,
     category TEXT NOT NULL,
@@ -105,6 +117,8 @@ CREATE TABLE IF NOT EXISTS content_patterns (
     title_pattern TEXT,
     hook TEXT,
     promise TEXT,
+    emotion TEXT,
+    beginner_appeal TEXT,
     is_question INTEGER,
     is_negative INTEGER,
     is_reason INTEGER,
@@ -169,10 +183,26 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+# Columns added after a table already existed in someone's local database. `CREATE TABLE IF NOT
+# EXISTS` silently no-ops on existing tables, so new columns need an explicit ALTER TABLE here.
+_COLUMN_MIGRATIONS = [
+    ("content_patterns", "emotion", "TEXT"),
+    ("content_patterns", "beginner_appeal", "TEXT"),
+]
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    for table, column, col_type in _COLUMN_MIGRATIONS:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+
+
 def init_db(db_path: Path) -> None:
     conn = get_connection(db_path)
     try:
         conn.executescript(SCHEMA)
+        _run_migrations(conn)
         conn.commit()
     finally:
         conn.close()

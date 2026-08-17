@@ -5,12 +5,13 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from research.channel_baseline import compute_channel_baseline
+from research.channel_baseline import compute_channel_baseline, has_fresh_baseline
 from research.db import connect
 from research.opportunity_score import OpportunityInputs, compute_opportunity_score
 from research.outlier_detector import (
     comment_rate,
     like_rate,
+    meets_min_grade,
     outlier_grade,
     outlier_ratio,
     subscriber_ratio,
@@ -42,6 +43,16 @@ def _matched_keyword_count(db_path: Path, video_id: str) -> int:
     return row["n"] if row else 1
 
 
+def estimate_analyze_units(db_path: Path, cache_ttl_hours: int = 168) -> int:
+    """Estimates the quota `research analyze` will spend, before running it. Counts only
+    (channel, content_type) pairs that don't already have a fresh cached baseline; each such
+    channel costs ~3 units (channels.list + playlistItems.list + one videos.list batch)."""
+    videos = _fetch_pending_videos(db_path)
+    pairs = {(v["channel_id"], v["content_type"]) for v in videos if v["content_type"] != "unknown"}
+    uncached = sum(0 if has_fresh_baseline(db_path, cid, ct, cache_ttl_hours) else 1 for cid, ct in pairs)
+    return uncached * 3
+
+
 def analyze_pending_videos(
     db_path: Path,
     yt: YouTubeClient,
@@ -52,11 +63,13 @@ def analyze_pending_videos(
     score_weights: dict,
     score_caps: dict,
     neutral_score: float = 50.0,
+    min_grade_to_store: str = "notable",
 ) -> dict:
     videos = _fetch_pending_videos(db_path)
     processed = 0
     skipped_unknown_type = 0
     skipped_no_baseline = 0
+    skipped_below_threshold = 0
 
     for v in videos:
         if v["content_type"] == "unknown":
@@ -110,6 +123,14 @@ def analyze_pending_videos(
             neutral_score=neutral_score,
         )
 
+        if not meets_min_grade(grade, min_grade_to_store):
+            # Below the interesting-enough threshold (e.g. "normal", <2x) -- don't keep it around.
+            # Delete any previously-stored row too, in case a re-analyze demoted this video.
+            with connect(db_path) as conn:
+                conn.execute("DELETE FROM outlier_scores WHERE video_id = ?", (v["video_id"],))
+            skipped_below_threshold += 1
+            continue
+
         with connect(db_path) as conn:
             conn.execute(
                 """
@@ -152,4 +173,5 @@ def analyze_pending_videos(
         "processed": processed,
         "skipped_unknown_type": skipped_unknown_type,
         "skipped_no_baseline": skipped_no_baseline,
+        "skipped_below_threshold": skipped_below_threshold,
     }

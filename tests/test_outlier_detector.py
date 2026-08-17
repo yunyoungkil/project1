@@ -2,6 +2,7 @@ from research.outlier_detector import (
     baseline_confidence,
     comment_rate,
     like_rate,
+    meets_min_grade,
     outlier_grade,
     outlier_ratio,
     subscriber_ratio,
@@ -88,3 +89,23 @@ def test_outlier_grade_thresholds():
     assert outlier_grade(10.0) == "very_strong"
     assert outlier_grade(20.0) == "exceptional"
     assert outlier_grade(None) is None
+
+
+def test_meets_min_grade_none_never_meets_threshold():
+    assert meets_min_grade(None, "notable") is False
+
+
+def test_meets_min_grade_exact_match():
+    assert meets_min_grade("notable", "notable") is True
+
+
+def test_meets_min_grade_above_threshold():
+    assert meets_min_grade("exceptional", "notable") is True
+
+
+def test_meets_min_grade_below_threshold():
+    assert meets_min_grade("normal", "notable") is False
+
+
+def test_meets_min_grade_unknown_grade_fails_open():
+    assert meets_min_grade("something_new", "notable") is True

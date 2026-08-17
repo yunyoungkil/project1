@@ -138,3 +138,13 @@ def upsert_videos(db_path: Path, videos: list[dict[str, Any]]) -> None:
                 """,
                 v,
             )
+            if v.get("view_count") is not None:
+                # Keep a point-in-time history so view growth can be reconstructed later, per the
+                # spec's optional "시간에 따른 조회수 변화는 snapshot 형태로 보존" requirement.
+                conn.execute(
+                    """
+                    INSERT INTO video_metrics_snapshots (video_id, view_count, like_count, comment_count)
+                    VALUES (:video_id, :view_count, :like_count, :comment_count)
+                    """,
+                    v,
+                )

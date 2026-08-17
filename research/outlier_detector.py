@@ -74,3 +74,18 @@ def outlier_grade(ratio: Optional[float], thresholds: dict[str, float] = DEFAULT
     if ratio >= thresholds["notable"]:
         return "notable"
     return "normal"
+
+
+GRADE_ORDER = ["normal", "notable", "strong", "very_strong", "exceptional"]
+
+
+def meets_min_grade(grade: Optional[str], min_grade: str) -> bool:
+    """Whether `grade` is at or above `min_grade` in severity. A video with no computable grade
+    (no baseline yet) never meets a threshold -- there's nothing to compare it against."""
+    if grade is None:
+        return False
+    try:
+        return GRADE_ORDER.index(grade) >= GRADE_ORDER.index(min_grade)
+    except ValueError:
+        return True  # unrecognized grade name in config -- fail open rather than silently drop data
+    return "normal"

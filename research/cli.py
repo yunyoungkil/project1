@@ -6,7 +6,7 @@ import logging
 import sys
 from datetime import datetime
 
-from research.analyze_pipeline import analyze_pending_videos
+from research.analyze_pipeline import analyze_pending_videos, estimate_analyze_units
 from research.analytics_client import run_oauth_flow
 from research.config import load_config
 from research.content_pattern_analyzer import analyze_video
@@ -17,7 +17,7 @@ from research.my_channel import compute_topic_scores, sync_my_channel_stats
 from research.outlier_detector import DEFAULT_GRADE_THRESHOLDS
 from research.weekly_report import build_weekly_report
 from research.youtube_client import YouTubeClient
-from research.youtube_search import run_category_search
+from research.youtube_search import estimate_search_units, run_category_search
 
 # Windows consoles often default to a non-UTF-8 codepage, which mangles the Korean text
 # throughout this project (titles, keyword pool, reports). Force UTF-8 output regardless of
@@ -79,13 +79,19 @@ def cmd_keywords_add(args, cfg):
 
 def cmd_search(args, cfg):
     yt = _require_youtube_client(cfg)
+    cache_ttl_hours = cfg.get("search", "cache_ttl_hours", default=168)
+    estimated = estimate_search_units(
+        cfg.db_path, cfg.keyword_pool_path, args.category,
+        cache_ttl_hours=cache_ttl_hours, query_limit=args.query_limit,
+    )
+    print(f"[quota] estimated {estimated} unit(s) for this search")
     result = run_category_search(
         cfg.db_path,
         cfg.keyword_pool_path,
         yt,
         args.category,
         max_results_per_query=cfg.get("search", "max_results_per_query", default=15),
-        cache_ttl_hours=cfg.get("search", "cache_ttl_hours", default=168),
+        cache_ttl_hours=cache_ttl_hours,
         region_code=cfg.get("search", "region_code", default="KR"),
         relevance_language=cfg.get("search", "relevance_language", default="ko"),
         query_limit=args.query_limit,
@@ -97,6 +103,8 @@ def cmd_search(args, cfg):
 
 def cmd_analyze(args, cfg):
     yt = _require_youtube_client(cfg)
+    estimated = estimate_analyze_units(cfg.db_path, cache_ttl_hours=cfg.get("baseline", "cache_ttl_hours", default=168))
+    print(f"[quota] estimated {estimated} unit(s) for this analyze run")
     result = analyze_pending_videos(
         cfg.db_path,
         yt,
@@ -106,6 +114,7 @@ def cmd_analyze(args, cfg):
         score_weights=cfg.get("opportunity_score", "weights", default={}),
         score_caps=cfg.get("opportunity_score", "caps", default={}),
         neutral_score=cfg.get("opportunity_score", "neutral_score_when_missing", default=50),
+        min_grade_to_store=cfg.get("outlier", "min_grade_to_store", default="notable"),
     )
     print(result)
 
@@ -171,11 +180,13 @@ def cmd_patterns(args, cfg):
             conn.execute(
                 """
                 INSERT INTO content_patterns (video_id, viewer_problem, title_pattern, hook, promise,
-                    is_question, is_negative, is_reason, is_result, is_number, is_fear_avoidance, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    emotion, beginner_appeal, is_question, is_negative, is_reason, is_result,
+                    is_number, is_fear_avoidance, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(video_id) DO UPDATE SET
                     viewer_problem=excluded.viewer_problem, title_pattern=excluded.title_pattern,
-                    hook=excluded.hook, promise=excluded.promise, is_question=excluded.is_question,
+                    hook=excluded.hook, promise=excluded.promise, emotion=excluded.emotion,
+                    beginner_appeal=excluded.beginner_appeal, is_question=excluded.is_question,
                     is_negative=excluded.is_negative, is_reason=excluded.is_reason,
                     is_result=excluded.is_result, is_number=excluded.is_number,
                     is_fear_avoidance=excluded.is_fear_avoidance, source=excluded.source,
@@ -183,7 +194,8 @@ def cmd_patterns(args, cfg):
                 """,
                 (
                     r["video_id"], pattern.viewer_problem, pattern.title_pattern, pattern.hook,
-                    pattern.promise, pattern.flags.is_question, pattern.flags.is_negative,
+                    pattern.promise, pattern.emotion, pattern.beginner_appeal,
+                    pattern.flags.is_question, pattern.flags.is_negative,
                     pattern.flags.is_reason, pattern.flags.is_result, pattern.flags.is_number,
                     pattern.flags.is_fear_avoidance, pattern.source,
                 ),

@@ -35,6 +35,39 @@ def keywords_for_category(pool: dict[str, dict], category: str) -> list[Keyword]
     return [k for k in iter_keywords(pool) if k.category == category]
 
 
+_PARTICLES = (
+    "에서부터", "으로부터", "부터", "까지", "에서", "으로", "이나", "라도", "에게", "한테",
+    "은", "는", "이", "가", "을", "를", "의", "에", "로", "와", "과", "도", "만",
+)
+
+
+def _stem(word: str) -> str:
+    """Strips a trailing Korean particle (조사) so '단어를'/'단어는'/'단어' all compare equal.
+    A small fixed particle list, not a real morphological analyzer -- deliberately simple."""
+    for particle in sorted(_PARTICLES, key=len, reverse=True):
+        if word.endswith(particle) and len(word) - len(particle) >= 2:
+            return word[: -len(particle)]
+    return word
+
+
+def best_matching_problem(title: str, problems: list[str]) -> str | None:
+    """Picks the problem statement (from a category's full problem list) whose words overlap the
+    most with the video title, instead of always using the category's first/"primary" problem.
+    Falls back to problems[0] when nothing overlaps, so behavior degrades gracefully."""
+    if not problems:
+        return None
+    title_lower = (title or "").lower()
+    best = problems[0]
+    best_score = -1
+    for problem in problems:
+        words = [_stem(w) for w in problem.lower().split() if len(w) > 1]
+        score = sum(1 for w in words if w and w in title_lower)
+        if score > best_score:
+            best_score = score
+            best = problem
+    return best
+
+
 def sync_to_db(db_path: Path, pool: dict[str, dict]) -> int:
     """Upserts all keywords from the YAML pool into the keywords table. Returns count inserted/updated."""
     count = 0

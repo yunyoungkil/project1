@@ -39,6 +39,11 @@ def _get_cached_baseline(db_path: Path, channel_id: str, content_type: str, ttl_
     return dict(row) if row else None
 
 
+def has_fresh_baseline(db_path: Path, channel_id: str, content_type: str, ttl_hours: int) -> bool:
+    """Public helper for quota estimation: would compute_channel_baseline reuse a cached result?"""
+    return _get_cached_baseline(db_path, channel_id, content_type, ttl_hours) is not None
+
+
 def _get_or_fetch_channel(db_path: Path, yt: YouTubeClient, channel_id: str) -> dict[str, Any] | None:
     with connect(db_path) as conn:
         row = conn.execute(

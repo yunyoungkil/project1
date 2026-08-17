@@ -1,8 +1,10 @@
+from research.db import connect, init_db
 from research.video_stats import (
     classify_content_type,
     normalize_channel,
     normalize_video,
     parse_iso8601_duration,
+    upsert_videos,
 )
 
 
@@ -87,3 +89,45 @@ def test_normalize_channel_visible_subscribers():
     result = normalize_channel(item)
     assert result["subscriber_count"] == 500
     assert result["subscriber_hidden"] == 0
+
+
+def test_upsert_videos_records_a_metrics_snapshot(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+
+    item = {
+        "id": "v1",
+        "snippet": {"channelId": "c1", "title": "t", "thumbnails": {}},
+        "statistics": {"viewCount": "1000", "likeCount": "10", "commentCount": "2"},
+        "contentDetails": {"duration": "PT5M"},
+    }
+    normalized = normalize_video(item, short_max=60, ambiguous_max=180)
+    upsert_videos(db_path, [normalized])
+
+    with connect(db_path) as conn:
+        rows = conn.execute("SELECT * FROM video_metrics_snapshots WHERE video_id = 'v1'").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["view_count"] == 1000
+    assert rows[0]["like_count"] == 10
+
+
+def test_upsert_videos_appends_a_new_snapshot_on_each_call(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+
+    def _item(views):
+        return {
+            "id": "v1",
+            "snippet": {"channelId": "c1", "title": "t", "thumbnails": {}},
+            "statistics": {"viewCount": str(views)},
+            "contentDetails": {"duration": "PT5M"},
+        }
+
+    upsert_videos(db_path, [normalize_video(_item(1000), short_max=60, ambiguous_max=180)])
+    upsert_videos(db_path, [normalize_video(_item(2000), short_max=60, ambiguous_max=180)])
+
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT view_count FROM video_metrics_snapshots WHERE video_id = 'v1' ORDER BY id"
+        ).fetchall()
+    assert [r["view_count"] for r in rows] == [1000, 2000]
