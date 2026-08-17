@@ -1,0 +1,103 @@
+# 리서치 시스템 설정. 코드에 하드코딩하지 않고 여기서 조정한다.
+
+paths:
+  db_path: data/research.db
+  keyword_pool_path: data/keyword_pool.yaml
+  reports_dir: reports
+  oauth_token_path: config/youtube_token.json
+
+search:
+  # 검색 1건당 최대 결과 수 (search.list maxResults)
+  max_results_per_query: 15
+  # 동일 검색어를 이 시간(시간 단위) 안에는 다시 호출하지 않는다.
+  cache_ttl_hours: 168 # 7일
+  # 한국어 콘텐츠 우선 (relevanceLanguage)
+  relevance_language: ko
+  region_code: KR
+
+baseline:
+  # 채널 baseline 계산에 사용할 최근 영상 수
+  sample_size: 30
+  min_sample_size: 5
+  # 이미 계산한 채널 baseline을 이 시간(시간 단위) 안에는 재사용하고 다시 API를 호출하지 않는다.
+  cache_ttl_hours: 168 # 7일
+
+  # 이보다 오래된 영상은 baseline에서 제외 (일 단위), null이면 제한 없음
+  max_age_days: 730
+  # 라이브 방송/프리미어는 baseline에서 제외
+  exclude_live: true
+
+content_type:
+  short_max_seconds: 60
+  ambiguous_max_seconds: 180 # 60~180초는 unknown 처리 (Shorts 3분 확장 정책으로 판별 불확실)
+
+outlier:
+  thresholds:
+    notable: 2
+    strong: 5
+    very_strong: 10
+    exceptional: 20
+  # 이 등급 이상만 outlier_scores에 저장 (quota/저장공간 절약)
+  min_grade_to_store: notable
+
+opportunity_score:
+  weights:
+    outlier_strength: 0.4
+    views_velocity: 0.2
+    subscriber_ratio: 0.1
+    engagement: 0.1
+    relevance: 0.2
+  caps:
+    outlier_ratio_cap: 50 # 이 배수에서 outlier_strength 만점
+    views_per_day_cap: 5000 # 이 값에서 views_velocity 만점
+    subscriber_ratio_cap: 5 # 구독자 대비 5배 조회수에서 만점
+    like_rate_cap: 0.08
+    comment_rate_cap: 0.01
+  neutral_score_when_missing: 50
+
+topic_score:
+  market_demand_top_n: 5
+  market_demand_weights:
+    avg_opportunity: 0.7
+    outlier_count: 0.3
+  outlier_count_cap: 10
+  fit_neutral_score: 50
+
+gemini:
+  model: gemini-flash-latest
+  timeout_seconds: 30
+  max_output_tokens: 1024
+
+my_channel:
+  lookback_days: 90
+  # traffic source costs one extra Analytics query per video, so only fetch it for the
+  # top-N most-viewed videos in the lookback window instead of the whole channel history.
+  traffic_source_top_n: 20
+
+channel:
+  name: 이해하면 쉬운 영어
+  audience: 영어를 배운 적은 있지만 여전히 영어가 어려운 성인 왕초보, 알파벳은 알지만 단어 읽기·듣기·실제 발음에서 어려움을 겪는 학습자
+  philosophy: 영어는 외울수록 어려워지고, 이해할수록 쉬워집니다.
+  focus_areas:
+    - 영어 읽기 원리
+    - 철자와 발음
+    - 강세
+    - schwa
+    - 연음
+    - 약화
+    - 묵음
+    - 실제 원어민 발음
+    - 영어가 안 들리는 이유
+    - 처음 보는 단어 읽기
+
+schedule:
+  monday: reading
+  tuesday: listening
+  wednesday: beginner
+  thursday: speaking
+  friday: report
+
+quota:
+  daily_unit_budget: 10000
+  search_list_cost: 100
+  list_endpoint_cost: 1

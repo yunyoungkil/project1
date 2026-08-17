@@ -1,0 +1,7 @@
+.env
+config/youtube_token.json
+data/research.db
+reports/*.md
+__pycache__/
+*.pyc
+.pytest_cache/
