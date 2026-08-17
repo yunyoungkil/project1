@@ -1,25 +1,58 @@
-from research.keyword_pool import best_matching_problem
+from research.keyword_pool import (
+    all_search_queries_for_category,
+    iter_keywords,
+    keywords_for_category,
+    problem_labels_for_category,
+)
+
+_POOL = {
+    "reading": {
+        "problems": [
+            {"id": "cannot_read_words", "label": "알파벳은 아는데 영어 단어를 못 읽는다", "search_queries": ["영어 단어 읽는 법"]},
+            {"id": "word_stress", "label": "영어 강세 위치를 어떻게 아는가", "search_queries": ["영어 강세", "강세 규칙"]},
+        ]
+    },
+    "listening": {
+        "problems": [
+            {"id": "liaison", "label": "영어 연음이 어렵다", "search_queries": ["영어 연음"]},
+        ]
+    },
+}
 
 
-def test_picks_the_problem_with_most_word_overlap():
-    problems = [
-        "영어 왕초보 어디서부터 시작해야 하나",
-        "알파벳은 아는데 영어 단어를 못 읽는다",
-        "영어 강세를 틀리면 문제가 되는가",
-    ]
-    result = best_matching_problem("영어 단어 못 읽는 이유 총정리", problems)
-    assert result == "알파벳은 아는데 영어 단어를 못 읽는다"
+def test_iter_keywords_assigns_correct_problem_per_query():
+    keywords = iter_keywords(_POOL)
+    by_query = {k.search_query: k for k in keywords}
+
+    assert by_query["영어 단어 읽는 법"].problem_id == "cannot_read_words"
+    assert by_query["영어 단어 읽는 법"].problem_label == "알파벳은 아는데 영어 단어를 못 읽는다"
+    assert by_query["영어 강세"].problem_id == "word_stress"
+    assert by_query["강세 규칙"].problem_id == "word_stress"
 
 
-def test_falls_back_to_first_problem_when_no_overlap():
-    problems = ["첫 번째 고민", "두 번째 고민"]
-    result = best_matching_problem("전혀 관련 없는 제목입니다", problems)
-    assert result == "첫 번째 고민"
+def test_different_queries_in_same_category_can_have_different_problems():
+    keywords = keywords_for_category(_POOL, "reading")
+    problem_ids = {k.problem_id for k in keywords}
+    assert problem_ids == {"cannot_read_words", "word_stress"}
 
 
-def test_empty_problems_returns_none():
-    assert best_matching_problem("아무 제목", []) is None
+def test_keywords_for_category_filters_correctly():
+    keywords = keywords_for_category(_POOL, "listening")
+    assert len(keywords) == 1
+    assert keywords[0].search_query == "영어 연음"
 
 
-def test_empty_title_falls_back_to_first_problem():
-    assert best_matching_problem("", ["고민 1", "고민 2"]) == "고민 1"
+def test_problem_labels_for_category():
+    labels = problem_labels_for_category(_POOL, "reading")
+    assert labels == ["알파벳은 아는데 영어 단어를 못 읽는다", "영어 강세 위치를 어떻게 아는가"]
+
+
+def test_all_search_queries_for_category_flattens_across_problems():
+    queries = all_search_queries_for_category(_POOL, "reading")
+    assert queries == ["영어 단어 읽는 법", "영어 강세", "강세 규칙"]
+
+
+def test_missing_category_returns_empty():
+    assert problem_labels_for_category(_POOL, "nonexistent") == []
+    assert all_search_queries_for_category(_POOL, "nonexistent") == []
+    assert keywords_for_category(_POOL, "nonexistent") == []

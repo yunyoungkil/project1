@@ -25,7 +25,8 @@ cp .env.example .env   # 값 채우기 (이미 .env가 있다면 생략)
 ```bash
 python -m research.cli auth                       # 1회 OAuth 동의 (로컬 브라우저 필요)
 python -m research.cli keywords list               # keyword pool 조회
-python -m research.cli keywords add --category reading --query "영어 발음 규칙"
+python -m research.cli keywords add --category reading --problem-id word_stress \
+  --problem-label "영어 강세 위치를 어떻게 아는가" --query "영어 강세"
 python -m research.cli search --category reading   # 카테고리 검색 + 수집 (캐시 적용)
 python -m research.cli analyze                     # baseline + outlier + opportunity score 계산
 python -m research.cli top --limit 20               # TOP N 출력
@@ -76,12 +77,23 @@ research/
 - `my_channel_fit_score` = 내 채널의 해당 카테고리 평균 retention(`average_percentage_viewed`) 대 채널
   전체 평균 비율. CTR/impressions는 YouTube Analytics API가 애초에 제공하지 않아(Studio 전용) retention만
   사용합니다. 내 채널 데이터가 없으면 중립값 50 + `fit_data_available=false`
-- `content_opportunity_score = market_demand_score × (my_channel_fit_score / 100)`
-- `problem_category`는 영상 제목과 카테고리의 각 고민 문장(`problems[]`)을 조사(을/를/은/는 등)를 제거한
-  단어 단위로 겹침 비교해서, 가장 관련 있는 고민 하나를 골라 기록합니다(`keyword_pool.best_matching_problem`).
-  카테고리 대표 고민 1개로 뭉뚱그리지 않고 영상별로 달라질 수 있습니다.
+- `content_opportunity_score = market_demand_score × (my_channel_fit_score / 100)`. 카테고리의
+  후보 영상 수가 `topic_score.min_candidate_videos`(기본 10) 미만이면 `market_demand_score`/
+  `content_opportunity_score`는 **0이 아니라 `null`**이고 `market_evidence_status =
+  "insufficient_data"`로 표시됩니다 — "시장 조사가 부족함"과 "시장 수요가 확인상 0임"은 다른
+  주장이라서 구분합니다.
 
 모든 가중치/캡/임계값은 `config/research_config.yaml`에서 조정 가능합니다.
+
+## Keyword Pool 구조와 Viewer Problem 매칭
+
+`data/keyword_pool.yaml`은 `category -> problems[] -> {id, label, search_queries[]}` 구조입니다.
+검색어 하나는 정확히 하나의 problem에 귀속되므로, 어떤 영상이 어떤 시청자 고민에서 발견됐는지는
+추측이 아니라 결정론적 조회입니다 (`research/keyword_pool.py`). `video_keyword_matches` 테이블이
+영상-검색어-problem 매치를 전부 보존하므로, 영상 하나가 여러 problem에 걸릴 수 있고
+(`videos.problem_category`는 그중 "처음 매치된 것" 하나만 보여주는 하위 호환용 요약 필드입니다),
+빈도 집계(`weekly_report.problem_frequency`)는 항상 `DISTINCT video_id, problem_label` 기준이라
+같은 영상이 여러 검색어에 걸려도 중복 집계되지 않습니다.
 
 ## Quota 절약
 
@@ -118,6 +130,23 @@ python -m research.cli auth
 커밋하지 마세요). 이 파일이 없어도 나머지 기능(시장 조사, outlier 탐지, TOP20)은 정상 동작하며,
 내 채널 적합도만 중립값(50)으로 표시됩니다.
 
+## Weekly Report 구조
+
+`reports/weekly_YYYY-MM-DD.md`는 9개 섹션입니다:
+
+1. 조사 상태 (카테고리별 query/후보/outlier 수, evidence status, confidence)
+2. 이번 주 발견 Outlier TOP10 — `videos.first_seen_at`(최초 발견 시점)이 이번 리포트 기간
+   안인 것만. 오래된 영상이라도 이번 주에 처음 발견됐다면 여기 포함됩니다.
+3. Evergreen Benchmark TOP10 — 발견 시점 무관, DB 전체 기준 TOP (2와 다른 근거)
+4. 카테고리별 Outlier TOP5 — 카테고리마다 독립적으로 계산되어, 특정 카테고리가 강해도 다른
+   카테고리의 결과가 가려지지 않습니다
+5. 반복적으로 나타나는 Viewer Problems — unique video × problem 기준 (같은 영상이 여러 검색어에
+   걸려도 중복 집계 안 됨)
+6. 강한 제목 Archetype — 고정 taxonomy(`content_pattern_analyzer.ARCHETYPES`) 기준 집계
+7. 시장 기회 — evidence 부족 카테고리는 "데이터 부족 (후보 N개)"로 표시, 점수 0 아님
+8. 다음 콘텐츠 후보 TOP5 — evidence가 `sufficient`인 카테고리만 대상
+9. 이번 주 제작 우선순위
+
 ## 데이터 스냅샷
 
 `video_metrics_snapshots` 테이블에 영상을 조회할 때마다(검색/baseline 수집 등) view/like/comment
@@ -126,8 +155,8 @@ count를 시점 기록으로 남깁니다. 같은 영상을 여러 번 조사하
 
 ## 매주 자동 실행 (Windows 작업 스케줄러)
 
-`research run-scheduled`는 `config/research_config.yaml`의 `schedule`(요일별 카테고리, 금요일은
-`report`)을 읽어 오늘 할 일을 실행합니다. 이 자체를 매일 자동으로 트리거하려면 Windows 작업
+`research run-scheduled`는 `config/research_config.yaml`의 `schedule`(월~토 6개 핵심 카테고리를
+하나씩, 일요일은 `report`)을 읽어 오늘 할 일을 실행합니다. 이 자체를 매일 자동으로 트리거하려면 Windows 작업
 스케줄러에 등록해야 합니다 (아래는 예시 명령이며, 프로젝트 경로/Python 경로는 환경에 맞게 바꿔야
 합니다 — 이 명령은 시스템에 영구적인 예약 작업을 만드므로 직접 실행 전에 검토해주세요):
 
@@ -149,20 +178,23 @@ pytest tests/
 ```
 
 핵심 계산 로직(median/mean baseline, outlier_ratio, subscriber_ratio, views_per_day,
-opportunity_score, content_type 분류, 결측치/0-division 처리, min_grade 필터링, 제목 패턴 rule
-플래그, topic score 계산, problem 매칭)에 대한 mock 기반 unit test 67개가 포함되어 있으며 실제
-API를 호출하지 않습니다.
+opportunity_score, content_type 분류, 결측치/0-division 처리, min_grade 필터링, keyword pool의
+problem 매칭이 결정론적인지, 카테고리 TOP5가 독립적으로 나오는지, "이번 주" 필터가 발견 시점을
+반영하는지, viewer problem 빈도가 중복 매치로 부풀지 않는지, archetype이 고정 taxonomy로만
+나오는지)에 대한 mock 기반 unit test 81개가 포함되어 있으며 실제 API를 호출하지 않습니다.
 
 ## 알려진 한계
 
-- `problem_category`는 영상 제목과 카테고리 고민 문장들의 단어 겹침으로 고르기 때문에, 제목에 관련
-  단어가 거의 없는 영상은 여전히 카테고리의 첫 번째 고민으로 폴백됩니다. 임베딩 기반 의미 매칭은
-  아닙니다.
 - Gemini 호출이 실패(키에 Generative Language API 미활성 등)하면 제목 패턴 분석은 rule-based
-  플래그(질문형/부정형/이유형/결과형/숫자형/공포회피형)만 사용하고, TOP3 추천 문구는 템플릿으로
-  대체됩니다. `emotion`/`beginner_appeal` 필드도 Gemini 없이는 채워지지 않습니다.
+  플래그(질문형/부정형/이유형/결과형/숫자형/공포회피형)와 `fallback_archetype()`(플래그 기반 간이
+  추정)만 사용하고, TOP5 추천 문구는 템플릿으로 대체됩니다. `emotion`/`beginner_appeal`/
+  `secondary_archetype` 필드도 Gemini 없이는 채워지지 않습니다.
+- Gemini가 고정 taxonomy 밖의 archetype id를 만들어내면(할루시네이션) 무시하고 rule-based 폴백으로
+  대체합니다 — 집계가 깨지지 않도록 하기 위함이며, 이 경우도 여전히 rule-based 추정치일 뿐입니다.
 - `my_channel_fit_score`는 내 영상 제목과 keyword pool 용어의 단어 매칭으로 카테고리를 추정합니다
   (임베딩 기반 의미 매칭이 아님).
+- `topic_score.min_candidate_videos` 임계값은 통계적 유의성 검정이 아니라 단순 카운트 기준입니다.
+  경계값 근처(예: 후보 9개 vs 11개)에서 sufficient/insufficient 판정이 급격히 바뀔 수 있습니다.
 - YouTube 공식 API는 Shorts 여부를 직접 제공하지 않아 duration 기반 추정에 의존합니다.
 - `research run-scheduled`를 실제로 매일 자동 실행하려면 위 작업 스케줄러 등록을 사용자가 직접
   해야 합니다 (코드가 스스로 등록하지 않음).

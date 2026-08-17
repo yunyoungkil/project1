@@ -1,82 +1,152 @@
-# 시청자 고민 Keyword Pool
-# 각 category는 problems(고민 목록)와 search_queries(YouTube 검색어 목록)를 가진다.
-# 여기 값을 수정/추가하면 코드 변경 없이 검색 대상이 바뀐다. (`research keywords add`로도 추가 가능)
+# 시청자 고민 Keyword Pool.
+# 구조: category -> problems[] -> {id, label, search_queries[]}
+# 각 검색어는 정확히 하나의 problem에 귀속된다 (매칭을 추측하지 않고 결정론적으로 추적하기 위함).
+# 값을 수정/추가하면 코드 변경 없이 검색 대상이 바뀐다. (`research keywords add`로도 추가 가능)
 
 reading:
   problems:
-    - 영어 왕초보 어디서부터 시작해야 하나
-    - 알파벳은 아는데 영어 단어를 못 읽는다
-    - 처음 보는 영어 단어를 읽을 수 없다
-    - 영어는 왜 철자대로 읽히지 않는가
-    - 영어 발음 규칙에는 왜 예외가 많은가
-    - 성인이 파닉스를 배워도 되는가
-    - 발음기호를 꼭 알아야 하는가
-    - 영어 모음은 왜 소리가 계속 바뀌는가
-    - 영어 묵음은 왜 생기는가
-    - 긴 영어 단어를 어디서 끊어 읽는가
-    - 영어 강세 위치를 어떻게 아는가
-    - 영어 강세를 틀리면 문제가 되는가
-  search_queries:
-    - 영어 단어 읽는 법
-    - 처음 보는 영어 단어 읽기
-    - 영어 철자 발음
-    - 영어 왕초보 읽기
-    - 성인 파닉스
-    - 영어 강세
+    - id: no_starting_point
+      label: 영어 왕초보 어디서부터 시작해야 하나
+      search_queries:
+        - 영어 왕초보 읽기
+        - 영어 공부 순서
+    - id: cannot_read_words
+      label: 알파벳은 아는데 영어 단어를 못 읽는다
+      search_queries:
+        - 영어 단어 읽는 법
+    - id: cannot_read_new_words
+      label: 처음 보는 영어 단어를 읽을 수 없다
+      search_queries:
+        - 처음 보는 영어 단어 읽기
+    - id: spelling_not_phonetic
+      label: 영어는 왜 철자대로 읽히지 않는가
+      search_queries:
+        - 영어 철자 발음
+    - id: pronunciation_exceptions
+      label: 영어 발음 규칙에는 왜 예외가 많은가
+      search_queries:
+        - 영어 발음 규칙 예외
+    - id: adult_phonics
+      label: 성인이 파닉스를 배워도 되는가
+      search_queries:
+        - 성인 파닉스
+    - id: ipa_necessity
+      label: 발음기호를 꼭 알아야 하는가
+      search_queries:
+        - 영어 발음기호
+    - id: vowel_sound_change
+      label: 영어 모음은 왜 소리가 계속 바뀌는가
+      search_queries:
+        - 영어 모음 소리 변화
+    - id: silent_letters
+      label: 영어 묵음은 왜 생기는가
+      search_queries:
+        - 영어 묵음
+    - id: syllable_breaking
+      label: 긴 영어 단어를 어디서 끊어 읽는가
+      search_queries:
+        - 긴 영어 단어 끊어 읽기
+    - id: word_stress_position
+      label: 영어 강세 위치를 어떻게 아는가
+      search_queries:
+        - 영어 강세
+    - id: word_stress_mistake
+      label: 영어 강세를 틀리면 문제가 되는가
+      search_queries:
+        - 영어 강세 실수
 
 listening:
   problems:
-    - 원어민은 왜 이렇게 빨리 말하는가
-    - 아는 단어인데 원어민이 말하면 안 들린다
-    - 자막을 보면 아는데 자막 없이 안 들린다
-    - 영어 연음이 어렵다
-    - did you가 왜 디쥬처럼 들리는가
-    - what are you가 왜 다르게 들리는가
-    - gonna/wanna는 왜 쓰는가
-    - 영화나 미드는 왜 특히 안 들리는가
-  search_queries:
-    - 영어 듣기 안되는 이유
-    - 원어민 영어 안 들림
-    - 영어 연음
-    - 미드 영어 듣기
-    - 원어민 영어 발음
+    - id: native_speed
+      label: 원어민은 왜 이렇게 빨리 말하는가
+      search_queries:
+        - 원어민 영어 빠름
+    - id: known_word_not_heard
+      label: 아는 단어인데 원어민이 말하면 안 들린다
+      search_queries:
+        - 원어민 영어 안 들림
+    - id: no_subtitle_listening
+      label: 자막을 보면 아는데 자막 없이 안 들린다
+      search_queries:
+        - 영어 자막 없이 듣기
+    - id: liaison
+      label: 영어 연음이 어렵다
+      search_queries:
+        - 영어 연음
+    - id: did_you_sound
+      label: did you가 왜 디쥬처럼 들리는가
+      search_queries:
+        - did you 발음
+    - id: what_are_you_sound
+      label: what are you가 왜 다르게 들리는가
+      search_queries:
+        - what are you 발음
+    - id: gonna_wanna
+      label: gonna/wanna는 왜 쓰는가
+      search_queries:
+        - gonna wanna 뜻
+    - id: movie_drama_listening
+      label: 영화나 미드는 왜 특히 안 들리는가
+      search_queries:
+        - 미드 영어 듣기
 
 vocabulary:
   problems:
-    - 영어 단어를 외워도 자꾸 잊는다
-    - 아는 단어가 말할 때 생각나지 않는다
-  search_queries:
-    - 영어 단어 안 외워짐
-    - 영어 단어 암기법
-    - 영어 단어 잊어버림
+    - id: forget_words
+      label: 영어 단어를 외워도 자꾸 잊는다
+      search_queries:
+        - 영어 단어 암기법
+        - 영어 단어 안 외워짐
+    - id: word_not_recalled
+      label: 아는 단어가 말할 때 생각나지 않는다
+      search_queries:
+        - 영어 단어 생각 안남
 
 speaking:
   problems:
-    - 문법은 아는데 말을 못한다
-    - 영어를 이해하지만 말을 못한다
-    - 머릿속에서 번역하느라 말이 느리다
-    - 틀릴까 봐 영어를 못한다
-  search_queries:
-    - 영어 말이 안 나와요
-    - 영어 알아듣는데 말 못함
-    - 영어 회화 왕초보
+    - id: grammar_but_no_speaking
+      label: 문법은 아는데 말을 못한다
+      search_queries:
+        - 영어 문법 아는데 말 못함
+    - id: understand_but_no_speaking
+      label: 영어를 이해하지만 말을 못한다
+      search_queries:
+        - 영어 듣기 되는데 말 못함
+    - id: translating_in_head
+      label: 머릿속에서 번역하느라 말이 느리다
+      search_queries:
+        - 영어 번역하며 말하기
+    - id: fear_of_mistakes
+      label: 틀릴까 봐 영어를 못한다
+      search_queries:
+        - 영어 실수 두려움
 
 pronunciation:
   problems:
-    - R/L 발음 구별
-    - TH 발음
-    - 단어는 아는데 문장을 못 읽는다
-  search_queries:
-    - 영어 R L 발음
-    - 영어 TH 발음
-    - 영어 문장 읽기 발음
+    - id: r_l_distinction
+      label: R/L 발음 구별
+      search_queries:
+        - 영어 R L 발음
+    - id: th_sound
+      label: TH 발음
+      search_queries:
+        - 영어 TH 발음
+    - id: cannot_read_sentences
+      label: 단어는 아는데 문장을 못 읽는다
+      search_queries:
+        - 영어 문장 읽기 발음
 
 beginner:
   problems:
-    - 읽기부터 해야 하는가 회화부터 해야 하는가
-    - 성인 영어 공부 순서
-    - 영어 왕초보 공부법
-  search_queries:
-    - 영어 공부 순서
-    - 성인 영어 왕초보
-    - 영어 공부법 추천
+    - id: reading_vs_speaking_order
+      label: 읽기부터 해야 하는가 회화부터 해야 하는가
+      search_queries:
+        - 영어 공부 읽기 회화 순서
+    - id: adult_study_order
+      label: 성인 영어 공부 순서
+      search_queries:
+        - 성인 영어 공부 순서
+    - id: beginner_study_method
+      label: 영어 왕초보 공부법
+      search_queries:
+        - 영어 왕초보 공부법 추천

@@ -62,6 +62,9 @@ topic_score:
     outlier_count: 0.3
   outlier_count_cap: 10
   fit_neutral_score: 50
+  # categories with fewer distinct matched candidate videos than this are reported as
+  # "insufficient_data" rather than getting a market_demand_score of 0.
+  min_candidate_videos: 10
 
 gemini:
   model: gemini-flash-latest
@@ -94,8 +97,10 @@ schedule:
   monday: reading
   tuesday: listening
   wednesday: beginner
-  thursday: speaking
-  friday: report
+  thursday: pronunciation
+  friday: speaking
+  saturday: vocabulary
+  sunday: report
 
 quota:
   daily_unit_budget: 10000

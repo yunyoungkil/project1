@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from research.db import connect
-from research.keyword_pool import Keyword, best_matching_problem, keywords_for_category, load_pool
+from research.keyword_pool import Keyword, keywords_for_category, load_pool
 from research.video_stats import normalize_video, upsert_videos
 from research.youtube_client import YouTubeClient
 
@@ -54,23 +54,21 @@ def _mark_cached(db_path: Path, category: str, search_query: str, result_count: 
         )
 
 
-def _record_matches(
-    db_path: Path, videos: list[dict], category: str, search_query: str, problems: list[str]
-) -> None:
-    """Records each video's match and picks the specific problem (out of the category's full
-    problem list) whose words best overlap the video's own title, rather than always tagging
-    every match in a category with the same "primary" problem."""
+def _record_matches(db_path: Path, videos: list[dict], kw: Keyword) -> None:
+    """Records each video's match. Every search query belongs to exactly one problem (see
+    keyword_pool.py), so the problem a video matched is a direct lookup -- not a guess."""
     with connect(db_path) as conn:
         for v in videos:
             vid = v["video_id"]
             conn.execute(
                 """
-                INSERT OR IGNORE INTO video_keyword_matches (video_id, category, search_query)
-                VALUES (?, ?, ?)
+                INSERT INTO video_keyword_matches (video_id, category, search_query, problem_id, problem_label)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(video_id, category, search_query) DO UPDATE SET
+                    problem_id = excluded.problem_id, problem_label = excluded.problem_label
                 """,
-                (vid, category, search_query),
+                (vid, kw.category, kw.search_query, kw.problem_id, kw.problem_label),
             )
-            problem = best_matching_problem(v.get("title"), problems) or category
             conn.execute(
                 """
                 UPDATE videos SET
@@ -79,7 +77,7 @@ def _record_matches(
                     is_search_result = 1
                 WHERE video_id = ?
                 """,
-                (search_query, problem, vid),
+                (kw.search_query, kw.problem_label, vid),
             )
 
 
@@ -104,7 +102,6 @@ def run_category_search(
 
     all_new_video_ids: set[str] = set()
     queries_run = 0
-    category_problems = (pool.get(category) or {}).get("problems") or []
 
     for kw in keywords:
         if _is_cached(db_path, kw.category, kw.search_query, cache_ttl_hours):
@@ -122,7 +119,7 @@ def run_category_search(
             items = yt.get_videos(video_ids)
             normalized = [normalize_video(i, short_max_seconds, ambiguous_max_seconds) for i in items]
             upsert_videos(db_path, normalized)
-            _record_matches(db_path, normalized, kw.category, kw.search_query, category_problems)
+            _record_matches(db_path, normalized, kw)
             all_new_video_ids.update(v["video_id"] for v in normalized)
 
     with connect(db_path) as conn:

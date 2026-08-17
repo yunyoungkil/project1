@@ -1,4 +1,4 @@
-from research.content_pattern_analyzer import analyze_title_rules, analyze_video
+from research.content_pattern_analyzer import ARCHETYPES, analyze_title_rules, analyze_video, fallback_archetype
 
 
 def test_is_question_detected():
@@ -88,3 +88,41 @@ def test_analyze_video_falls_back_when_gemini_returns_none():
     pattern = analyze_video("v1", "영어 단어 읽는 법", gemini=_FakeGemini(None))
     assert pattern.source == "rule"
     assert pattern.viewer_problem is None
+
+
+def test_analyze_video_without_gemini_still_gets_a_valid_archetype():
+    pattern = analyze_video("v1", "영어 공부법 5가지", gemini=None)
+    assert pattern.primary_archetype in ARCHETYPES
+    assert pattern.primary_archetype == "number_list"
+
+
+def test_fallback_archetype_number_list():
+    flags = analyze_title_rules("영어 공부법 5가지")
+    assert fallback_archetype(flags) == "number_list"
+
+
+def test_fallback_archetype_never_returns_none():
+    flags = analyze_title_rules("아무 특징 없는 평범한 제목")
+    assert fallback_archetype(flags) in ARCHETYPES
+
+
+def test_gemini_archetype_is_used_when_valid():
+    response = {"primary_archetype": "roadmap", "secondary_archetype": "beginner_target"}
+    pattern = analyze_video("v1", "영어 공부 순서 정리", gemini=_FakeGemini(response))
+    assert pattern.primary_archetype == "roadmap"
+    assert pattern.secondary_archetype == "beginner_target"
+
+
+def test_gemini_hallucinated_archetype_falls_back_to_rule_based():
+    """If Gemini invents an id outside the fixed taxonomy, aggregation would silently fragment --
+    reject it and fall back to the deterministic rule-based guess instead."""
+    response = {"primary_archetype": "made_up_archetype_xyz"}
+    pattern = analyze_video("v1", "영어 공부법 5가지", gemini=_FakeGemini(response))
+    assert pattern.primary_archetype == "number_list"
+
+
+def test_gemini_null_secondary_archetype_stays_none():
+    response = {"primary_archetype": "one_solution", "secondary_archetype": None}
+    pattern = analyze_video("v1", "이것 하나면 끝", gemini=_FakeGemini(response))
+    assert pattern.primary_archetype == "one_solution"
+    assert pattern.secondary_archetype is None

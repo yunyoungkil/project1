@@ -69,12 +69,12 @@ def cmd_auth(args, cfg):
 def cmd_keywords_list(args, cfg):
     pool = load_pool(cfg.keyword_pool_path)
     for kw in iter_keywords(pool):
-        print(f"[{kw.category}] {kw.search_query}  (problem: {kw.problem})")
+        print(f"[{kw.category}/{kw.problem_id}] {kw.search_query}  (problem: {kw.problem_label})")
 
 
 def cmd_keywords_add(args, cfg):
-    add_keyword(cfg.keyword_pool_path, args.category, args.query, args.problem)
-    print(f"Added '{args.query}' to category '{args.category}'")
+    add_keyword(cfg.keyword_pool_path, args.category, args.problem_id, args.problem_label, args.query)
+    print(f"Added '{args.query}' to category '{args.category}' / problem '{args.problem_id}'")
 
 
 def cmd_search(args, cfg):
@@ -180,13 +180,14 @@ def cmd_patterns(args, cfg):
             conn.execute(
                 """
                 INSERT INTO content_patterns (video_id, viewer_problem, title_pattern, hook, promise,
-                    emotion, beginner_appeal, is_question, is_negative, is_reason, is_result,
-                    is_number, is_fear_avoidance, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    emotion, beginner_appeal, primary_archetype, secondary_archetype, is_question,
+                    is_negative, is_reason, is_result, is_number, is_fear_avoidance, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(video_id) DO UPDATE SET
                     viewer_problem=excluded.viewer_problem, title_pattern=excluded.title_pattern,
                     hook=excluded.hook, promise=excluded.promise, emotion=excluded.emotion,
-                    beginner_appeal=excluded.beginner_appeal, is_question=excluded.is_question,
+                    beginner_appeal=excluded.beginner_appeal, primary_archetype=excluded.primary_archetype,
+                    secondary_archetype=excluded.secondary_archetype, is_question=excluded.is_question,
                     is_negative=excluded.is_negative, is_reason=excluded.is_reason,
                     is_result=excluded.is_result, is_number=excluded.is_number,
                     is_fear_avoidance=excluded.is_fear_avoidance, source=excluded.source,
@@ -195,6 +196,7 @@ def cmd_patterns(args, cfg):
                 (
                     r["video_id"], pattern.viewer_problem, pattern.title_pattern, pattern.hook,
                     pattern.promise, pattern.emotion, pattern.beginner_appeal,
+                    pattern.primary_archetype, pattern.secondary_archetype,
                     pattern.flags.is_question, pattern.flags.is_negative,
                     pattern.flags.is_reason, pattern.flags.is_result, pattern.flags.is_number,
                     pattern.flags.is_fear_avoidance, pattern.source,
@@ -216,6 +218,7 @@ def cmd_patterns(args, cfg):
         market_demand_weights=cfg.get("topic_score", "market_demand_weights", default=None),
         outlier_count_cap=cfg.get("topic_score", "outlier_count_cap", default=10),
         fit_neutral_score=cfg.get("topic_score", "fit_neutral_score", default=50),
+        min_candidate_videos=cfg.get("topic_score", "min_candidate_videos", default=10),
     )
     for t in topics:
         print(t)
@@ -273,8 +276,9 @@ def build_parser() -> argparse.ArgumentParser:
     kw_sub.add_parser("list").set_defaults(func=cmd_keywords_list)
     kw_add = kw_sub.add_parser("add")
     kw_add.add_argument("--category", required=True)
+    kw_add.add_argument("--problem-id", required=True, help="Short stable id, e.g. 'word_stress'")
+    kw_add.add_argument("--problem-label", required=True, help="Natural-language viewer problem")
     kw_add.add_argument("--query", required=True)
-    kw_add.add_argument("--problem", default=None)
     kw_add.set_defaults(func=cmd_keywords_add)
 
     search = sub.add_parser("search", help="Search a category and collect videos")

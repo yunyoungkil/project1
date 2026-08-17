@@ -4,6 +4,11 @@ market_demand_score / my_channel_fit_score / content_opportunity_score per probl
 If no OAuth token exists yet (`research auth` hasn't been run), my-channel data is simply
 unavailable and my_channel_fit_score falls back to a neutral value with `fit_data_available=False`
 -- the rest of the pipeline (market-only ranking) still works.
+
+market_demand_score is deliberately kept `None` (not 0) when a category hasn't been searched
+enough yet -- "no market evidence collected" and "market demand is zero" are different claims, and
+conflating them would make an under-researched topic look like a dead one. See
+`market_evidence_status` / `evidence_confidence` on each result.
 """
 from __future__ import annotations
 
@@ -14,7 +19,7 @@ from pathlib import Path
 
 from research.analytics_client import AnalyticsClient, load_credentials
 from research.db import connect
-from research.keyword_pool import load_pool
+from research.keyword_pool import all_search_queries_for_category, load_pool, problem_labels_for_category
 from research.youtube_client import YouTubeClient
 
 logger = logging.getLogger(__name__)
@@ -116,6 +121,14 @@ def _matches_category(title: str, queries: list[str], problems: list[str]) -> bo
     return False
 
 
+def _evidence_confidence(candidate_count: int, outlier_count: int, min_candidate_videos: int) -> str:
+    if candidate_count >= 30 or outlier_count >= 5:
+        return "high"
+    if candidate_count >= min_candidate_videos:
+        return "medium"
+    return "low"
+
+
 def compute_topic_scores(
     db_path: Path,
     keyword_pool_path: Path,
@@ -124,6 +137,7 @@ def compute_topic_scores(
     market_demand_weights: dict | None = None,
     outlier_count_cap: int = 10,
     fit_neutral_score: float = 50.0,
+    min_candidate_videos: int = 10,
 ) -> list[dict]:
     market_demand_weights = market_demand_weights or {"avg_opportunity": 0.7, "outlier_count": 0.3}
     pool = load_pool(keyword_pool_path)
@@ -134,33 +148,29 @@ def compute_topic_scores(
     overall_pct_viewed = _avg([v["average_percentage_viewed"] for v in my_videos if v.get("average_percentage_viewed") is not None])
 
     results = []
-    for category, body in pool.items():
-        queries = body.get("search_queries") or []
-        problems = body.get("problems") or []
+    for category in pool:
+        queries = all_search_queries_for_category(pool, category)
+        problems = problem_labels_for_category(pool, category)
 
         with connect(db_path) as conn:
+            candidate_video_count = conn.execute(
+                "SELECT COUNT(DISTINCT video_id) AS n FROM video_keyword_matches WHERE category = ?",
+                (category,),
+            ).fetchone()["n"]
             rows = conn.execute(
                 """
-                SELECT os.opportunity_score, os.outlier_grade
+                SELECT DISTINCT os.video_id, os.opportunity_score, os.outlier_grade
                 FROM outlier_scores os
-                JOIN videos v ON v.video_id = os.video_id
-                WHERE v.problem_category = ? OR v.matched_keyword IN (
-                    SELECT search_query FROM keywords WHERE category = ?
-                )
+                JOIN video_keyword_matches vkm ON vkm.video_id = os.video_id
+                WHERE vkm.category = ?
                 ORDER BY os.opportunity_score DESC
                 """,
-                (problems[0] if problems else category, category),
+                (category,),
             ).fetchall()
 
         scores = [r["opportunity_score"] for r in rows if r["opportunity_score"] is not None]
         outlier_count = sum(1 for r in rows if r["outlier_grade"] and r["outlier_grade"] != "normal")
         top_scores = scores[:market_demand_top_n]
-        avg_opportunity = _avg(top_scores) or 0.0
-        market_demand_score = min(
-            100.0,
-            market_demand_weights["avg_opportunity"] * avg_opportunity
-            + market_demand_weights["outlier_count"] * min(100.0, (outlier_count / outlier_count_cap) * 100),
-        )
 
         matched_my_videos = [v for v in my_videos if _matches_category(v.get("title") or "", queries, problems)]
         # CTR/impressions aren't available from the YouTube Analytics API (see analytics_client.py),
@@ -174,10 +184,25 @@ def compute_topic_scores(
         else:
             my_channel_fit_score = fit_neutral_score
 
-        content_opportunity_score = market_demand_score * (my_channel_fit_score / 100.0)
+        if candidate_video_count < min_candidate_videos:
+            market_evidence_status = "insufficient_data"
+            market_demand_score = None
+            content_opportunity_score = None
+        else:
+            market_evidence_status = "sufficient"
+            avg_opportunity = _avg(top_scores) or 0.0
+            market_demand_score = min(
+                100.0,
+                market_demand_weights["avg_opportunity"] * avg_opportunity
+                + market_demand_weights["outlier_count"] * min(100.0, (outlier_count / outlier_count_cap) * 100),
+            )
+            content_opportunity_score = market_demand_score * (my_channel_fit_score / 100.0)
+
+        evidence_confidence = _evidence_confidence(candidate_video_count, outlier_count, min_candidate_videos)
 
         evidence = {
             "outlier_video_count": outlier_count,
+            "candidate_video_count": candidate_video_count,
             "top_opportunity_scores": top_scores,
             "matched_my_video_count": len(matched_my_videos),
         }
@@ -187,8 +212,9 @@ def compute_topic_scores(
                 """
                 INSERT INTO topic_opportunities (problem_category, market_demand_score,
                     my_channel_fit_score, fit_data_available, content_opportunity_score,
-                    outlier_video_count, evidence_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    outlier_video_count, market_evidence_status, candidate_video_count,
+                    evidence_confidence, evidence_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     category,
@@ -197,6 +223,9 @@ def compute_topic_scores(
                     1 if fit_data_available else 0,
                     content_opportunity_score,
                     outlier_count,
+                    market_evidence_status,
+                    candidate_video_count,
+                    evidence_confidence,
                     json.dumps(evidence, ensure_ascii=False),
                 ),
             )
@@ -209,10 +238,19 @@ def compute_topic_scores(
                 "fit_data_available": fit_data_available,
                 "content_opportunity_score": content_opportunity_score,
                 "outlier_video_count": outlier_count,
+                "candidate_video_count": candidate_video_count,
+                "market_evidence_status": market_evidence_status,
+                "evidence_confidence": evidence_confidence,
             }
         )
 
-    return sorted(results, key=lambda r: r["content_opportunity_score"], reverse=True)
+    # Categories with enough evidence rank by score; everything else (insufficient data) sorts
+    # after them instead of masquerading as a confirmed zero-opportunity topic.
+    return sorted(
+        results,
+        key=lambda r: (r["content_opportunity_score"] is not None, r["content_opportunity_score"] or 0.0),
+        reverse=True,
+    )
 
 
 def _avg(values: list[float]) -> float | None:

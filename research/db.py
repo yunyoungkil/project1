@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS keywords (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     category TEXT NOT NULL,
     problem TEXT,
+    problem_id TEXT,
     search_query TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(category, search_query)
@@ -81,6 +82,8 @@ CREATE TABLE IF NOT EXISTS video_keyword_matches (
     video_id TEXT NOT NULL,
     category TEXT NOT NULL,
     search_query TEXT NOT NULL,
+    problem_id TEXT,
+    problem_label TEXT,
     matched_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (video_id, category, search_query)
 );
@@ -119,6 +122,8 @@ CREATE TABLE IF NOT EXISTS content_patterns (
     promise TEXT,
     emotion TEXT,
     beginner_appeal TEXT,
+    primary_archetype TEXT,
+    secondary_archetype TEXT,
     is_question INTEGER,
     is_negative INTEGER,
     is_reason INTEGER,
@@ -154,6 +159,9 @@ CREATE TABLE IF NOT EXISTS topic_opportunities (
     fit_data_available INTEGER NOT NULL DEFAULT 0,
     content_opportunity_score REAL,
     outlier_video_count INTEGER,
+    market_evidence_status TEXT NOT NULL DEFAULT 'sufficient',
+    candidate_video_count INTEGER NOT NULL DEFAULT 0,
+    evidence_confidence TEXT NOT NULL DEFAULT 'low',
     evidence_json TEXT
 );
 
@@ -188,6 +196,14 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
 _COLUMN_MIGRATIONS = [
     ("content_patterns", "emotion", "TEXT"),
     ("content_patterns", "beginner_appeal", "TEXT"),
+    ("content_patterns", "primary_archetype", "TEXT"),
+    ("content_patterns", "secondary_archetype", "TEXT"),
+    ("keywords", "problem_id", "TEXT"),
+    ("video_keyword_matches", "problem_id", "TEXT"),
+    ("video_keyword_matches", "problem_label", "TEXT"),
+    ("topic_opportunities", "market_evidence_status", "TEXT NOT NULL DEFAULT 'sufficient'"),
+    ("topic_opportunities", "candidate_video_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("topic_opportunities", "evidence_confidence", "TEXT NOT NULL DEFAULT 'low'"),
 ]
 
 
