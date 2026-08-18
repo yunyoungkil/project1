@@ -2,6 +2,7 @@
 config/youtube_token.json
 data/research.db
 reports/*.md
+assets/
 __pycache__/
 *.pyc
 .pytest_cache/

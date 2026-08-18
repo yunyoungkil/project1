@@ -9,6 +9,15 @@ from datetime import datetime
 
 from research.analyze_pipeline import analyze_pending_videos, estimate_analyze_units
 from research.analytics_client import run_oauth_flow
+from research.asset_generator import (
+    PRONUNCIATION_REVIEW_STATES,
+    TONE_CONSISTENCY_REVIEW_STATES,
+    _latest_generated_rows_for_plan,
+    build_asset_generation_report,
+    record_pronunciation_review,
+    record_tone_consistency_review,
+    select_target_plan,
+)
 from research.config import load_config
 from research.content_pattern_analyzer import analyze_video
 from research.db import connect, init_db
@@ -31,6 +40,7 @@ from research.production_blueprint import build_production_blueprint_report
 from research.production_planner import build_production_plan_report
 from research.script_writer import build_script_report
 from research.topic_candidates import build_topic_candidates_report
+from research.tts_client import GeminiTTSClient
 from research.video_director import build_video_direction_report
 from research.weekly_report import build_weekly_report
 from research.youtube_client import YouTubeClient
@@ -71,6 +81,15 @@ def _gemini_client(cfg) -> GeminiClient:
         cfg.gemini_api_key,
         model=cfg.get("gemini", "model", default="gemini-flash-latest"),
         timeout_seconds=cfg.get("gemini", "timeout_seconds", default=30),
+    )
+
+
+def _tts_client(cfg) -> GeminiTTSClient:
+    return GeminiTTSClient(
+        cfg.gemini_api_key,
+        model=cfg.get("gemini", "tts_model", default="gemini-3.1-flash-tts-preview"),
+        timeout_seconds=cfg.get("gemini", "timeout_seconds", default=30),
+        max_retries=cfg.get("asset_generation", "max_retries", default=3),
     )
 
 
@@ -478,6 +497,87 @@ def cmd_production_plan(args, cfg):
     return path
 
 
+def cmd_assets(args, cfg):
+    if args.dry_run:
+        mode = "DRY_RUN"
+    elif args.sample:
+        mode = "SAMPLE"
+    else:
+        mode = "FULL"
+    log_stage_start("ASSETS", f"11 Production Plan의 실제 TTS Asset 생성/검증 ({mode})")
+    path = build_asset_generation_report(
+        cfg.db_path, cfg.reports_dir, cfg.assets_dir, _tts_client(cfg),
+        plan_id=args.plan_id, mode=mode,
+        tts_model=cfg.get("gemini", "tts_model", default="gemini-3.1-flash-tts-preview"),
+        max_segment_seconds=cfg.get("asset_generation", "max_segment_seconds", default=12),
+    )
+    print(f"Asset generation report written to {path}")
+    log_stage_done("ASSETS", str(path))
+    return path
+
+
+def cmd_assets_review(args, cfg):
+    # 12-1 section 24: every CLI command in this project runs non-interactively to completion --
+    # none read from stdin. An [A]pprove/[R]eject prompt would be the first interactive command in
+    # the project, so this stays a plain listing; approving/rejecting is a direct DB update against
+    # generated_assets.metadata_json.pronunciation_review (documented below), not a new workflow.
+    plan_row = select_target_plan(cfg.db_path, plan_id=args.plan_id)
+    if plan_row is None:
+        print("No production_plans row found.", file=sys.stderr)
+        return
+    rows = _latest_generated_rows_for_plan(cfg.db_path, plan_row["id"])
+    priority_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    pending = []
+    for r in rows:
+        try:
+            metadata = json.loads(r.get("metadata_json") or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        if metadata.get("pronunciation_review") == "PENDING":
+            pending.append((r, metadata))
+    pending.sort(key=lambda item: priority_rank.get(item[1].get("review_priority"), 9))
+
+    print(f"production_plans.id: {plan_row['id']}  PENDING review: {len(pending)}")
+    for r, metadata in pending:
+        print(
+            f"[{metadata.get('review_priority')}] {r['asset_id']} mode={r['speech_mode']} "
+            f"voice={r['voice_name']} file={r['file_path']} duration_ms={r['duration_ms']}"
+        )
+    print(
+        "\nTo approve/reject, update generated_assets.metadata_json.pronunciation_review "
+        "(\"APPROVED\" / \"REJECTED\" / \"REGENERATE_REQUIRED\") for the asset_id directly in the DB, "
+        "or pass --set ASSET_ID=STATUS (repeatable) to this command."
+    )
+
+    # 12-2 section 16: non-interactive, scriptable recording of an already-made human verdict --
+    # not an interactive [A]pprove/[R]eject prompt, consistent with section 24's CLI philosophy.
+    for entry in getattr(args, "set", None) or []:
+        if "=" not in entry:
+            print(f"Skipping invalid --set entry (expected ASSET_ID=STATUS): {entry}", file=sys.stderr)
+            continue
+        asset_id, status = entry.split("=", 1)
+        asset_id, status = asset_id.strip(), status.strip().upper()
+        if status not in PRONUNCIATION_REVIEW_STATES:
+            print(f"Skipping --set {entry}: invalid status (must be one of {sorted(PRONUNCIATION_REVIEW_STATES)})", file=sys.stderr)
+            continue
+        updated = record_pronunciation_review(cfg.db_path, plan_row["id"], asset_id, status)
+        print(f"Recorded {asset_id} -> {status} ({updated} row(s) updated)")
+
+    # 12-3 section 20: tone_consistency_review is a separate axis from pronunciation_review --
+    # "pronunciation is correct but tone doesn't match" needs its own recordable verdict.
+    for entry in getattr(args, "set_tone", None) or []:
+        if "=" not in entry:
+            print(f"Skipping invalid --set-tone entry (expected ASSET_ID=STATUS): {entry}", file=sys.stderr)
+            continue
+        asset_id, status = entry.split("=", 1)
+        asset_id, status = asset_id.strip(), status.strip().upper()
+        if status not in TONE_CONSISTENCY_REVIEW_STATES:
+            print(f"Skipping --set-tone {entry}: invalid status (must be one of {sorted(TONE_CONSISTENCY_REVIEW_STATES)})", file=sys.stderr)
+            continue
+        updated = record_tone_consistency_review(cfg.db_path, plan_row["id"], asset_id, status)
+        print(f"Recorded tone_consistency_review {asset_id} -> {status} ({updated} row(s) updated)")
+
+
 def cmd_run_scheduled(args, cfg):
     weekday = datetime.now().strftime("%A").lower()
     task = cfg.get("schedule", weekday)
@@ -595,6 +695,18 @@ def build_parser() -> argparse.ArgumentParser:
     production_plan = sub.add_parser("production-plan", help="Compile the 10-selected Video Direction into a Production Plan (no new API calls)")
     production_plan.add_argument("--direction-id", type=int, default=None, help="Use a specific video_directions id instead of the latest ready_for_production_planning direction")
     production_plan.set_defaults(func=cmd_production_plan)
+
+    assets = sub.add_parser("assets", help="Generate and validate real Gemini TTS audio assets for the 11-selected Production Plan")
+    assets.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready_for_asset_generation plan")
+    assets.add_argument("--dry-run", action="store_true", help="Count planned assets and expected API calls without calling Gemini TTS")
+    assets.add_argument("--sample", action="store_true", help="Generate the 12-1 Sample Matrix (KO_NARRATION short+segmented-long, EN_NATIVE across two words, isolated phonemes, both blending strategies) via real Gemini TTS calls")
+    assets.set_defaults(func=cmd_assets)
+
+    assets_review = sub.add_parser("assets-review", help="List generated assets pending human pronunciation review (non-interactive)")
+    assets_review.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready_for_asset_generation plan")
+    assets_review.add_argument("--set", action="append", metavar="ASSET_ID=STATUS", help="Record an already-made human pronunciation review verdict (repeatable), e.g. --set SP007=APPROVED")
+    assets_review.add_argument("--set-tone", action="append", metavar="ASSET_ID=STATUS", help="Record an already-made human tone_consistency review verdict (repeatable), e.g. --set-tone SP029::CONTEXTUAL_WORD=REJECTED")
+    assets_review.set_defaults(func=cmd_assets_review)
 
     sub.add_parser("run-scheduled", help="Run today's scheduled task from config").set_defaults(func=cmd_run_scheduled)
 

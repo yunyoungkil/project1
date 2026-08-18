@@ -447,6 +447,50 @@ CREATE TABLE IF NOT EXISTS api_call_log (
     called_at TEXT NOT NULL DEFAULT (datetime('now')),
     context TEXT
 );
+
+CREATE TABLE IF NOT EXISTS generated_assets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    production_plan_id INTEGER NOT NULL,
+    content_block_id TEXT,
+    asset_id TEXT NOT NULL,
+    source_speech_asset_id TEXT NOT NULL,
+    asset_type TEXT NOT NULL,
+    asset_role TEXT,
+    speech_mode TEXT NOT NULL,
+    voice_name TEXT,
+    status TEXT NOT NULL,
+    file_path TEXT,
+    mime_type TEXT,
+    duration_ms INTEGER,
+    sample_rate INTEGER,
+    channels INTEGER,
+    checksum TEXT,
+    generation_method TEXT,
+    generation_attempts INTEGER NOT NULL DEFAULT 0,
+    cache_key TEXT,
+    validation_json TEXT,
+    metadata_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS asset_generation_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    production_plan_id INTEGER NOT NULL,
+    mode TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT,
+    status TEXT NOT NULL,
+    planned_count INTEGER NOT NULL DEFAULT 0,
+    generated_count INTEGER NOT NULL DEFAULT 0,
+    reused_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    unverified_count INTEGER NOT NULL DEFAULT 0,
+    skipped_count INTEGER NOT NULL DEFAULT 0,
+    api_calls INTEGER NOT NULL DEFAULT 0,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    report_json TEXT
+);
 """
 
 

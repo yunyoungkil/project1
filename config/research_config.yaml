@@ -5,6 +5,7 @@ paths:
   keyword_pool_path: data/keyword_pool.yaml
   reports_dir: reports
   oauth_token_path: config/youtube_token.json
+  assets_dir: assets
 
 search:
   # 검색 1건당 최대 결과 수 (search.list maxResults)
@@ -81,6 +82,26 @@ gemini:
   # every section plus opening/mini success/ending in one call -- the largest single response in
   # the pipeline; 8000 truncated mid-response once the per-block metadata was added.
   max_output_tokens_script: 12000
+  # 12 Verified Asset Generator's real TTS model -- confirmed live via REST (generateContent with
+  # responseModalities=["AUDIO"]) as of 2026, not a placeholder.
+  tts_model: gemini-3.1-flash-tts-preview
+
+asset_generation:
+  # generateContent TTS occasionally returns a 5xx/timeout/empty response; retried immediately up
+  # to this many times before the asset is recorded FAILED. No infinite retry.
+  max_retries: 3
+  # Small, deliberately narrow allowlist (spec section 15) -- tags are added to a transcript only
+  # when genuinely needed, not sprinkled onto every asset.
+  approved_audio_tags: ["[slow]", "[short pause]", "[long pause]"]
+  podcast_audio_tags: ["[laughs]", "[sighs]"]
+  # KO_NARRATION segmentation ceiling (12-1). Not based on a hard Google-documented quality
+  # threshold -- their own docs only flag drift after "a few minutes" -- this is instead sized for
+  # Renderer-side control (caption sync / keyword highlighting granularity, cheaper partial
+  # regeneration), well under the documented risk zone.
+  max_segment_seconds: 12
+  # 12-2 section 11: confirmed default beginner blending strategy -- documents the same value as
+  # asset_generator.DEFAULT_BLENDING_STRATEGY so the policy isn't only visible in code.
+  default_blending_strategy: DIRECT_SEQUENCE
   # `research direction` only asks for a short 3-gate judgment (podcast/clip/explanation
   # necessity) or, for PODCAST, a dialogue-beat script -- comparable to the blueprint prompt.
   max_output_tokens_direction: 6000

@@ -34,6 +34,10 @@ class Config:
     def oauth_token_path(self) -> Path:
         return PROJECT_ROOT / self.raw["paths"]["oauth_token_path"]
 
+    @property
+    def assets_dir(self) -> Path:
+        return PROJECT_ROOT / self.raw["paths"]["assets_dir"]
+
     def get(self, *keys: str, default: Any = None) -> Any:
         node: Any = self.raw
         for key in keys:
