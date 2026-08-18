@@ -309,23 +309,163 @@ def check_educational_wording_preserved(production_blocks: list[dict], speech_as
 
 
 # ---------------------------------------------------------------------------
-# required_content coverage type classification (spec sections 15-19): FACTUAL_CONTENT items are
-# checked by lexical overlap as before; STYLE_INTENT items (tone/manner, no concrete
-# content/target) instead need structural evidence -- an Ending/Resolution block with real
-# KO_NARRATION containing an actual ending/greeting/continuation signal.
+# required_content coverage type classification (11-2 spec sections 3-21): a required_content
+# bullet can express four different kinds of intent, and each needs its own evidence source --
+# lexical overlap alone (the pre-11-2 behavior) only ever proves FACTUAL_CONTENT. A phrase like
+# "정답 공개 전 3초 생각 시간 부여" was previously misclassified as FACTUAL_CONTENT purely because it
+# contains a digit and the word "정답" -- it has no teachable word/IPA/example to lexically match
+# against, so it stayed UNCOVERED forever even though the real PAUSE 3000ms already implements it.
+# Priority order (spec section 4) checks STRUCTURAL/INTERACTION signals before the FACTUAL digit
+# regex specifically so "3초 생각 시간" is never claimed by the digit branch.
 # ---------------------------------------------------------------------------
 
-_STYLE_SIGNAL_WORDS = ("자연스럽", "부담 없", "친근하", "차분하", "편안하", "따뜻하", "격려")
+# "초"/"분" alone are common Korean syllables embedded in unrelated words (e.g. "차분하고" contains
+# "분") -- only a real time expression (digit + 초/분) counts as a structural time signal. "순서"/
+# "먼저"/"뒤에" are deliberately excluded from the phrase list even though the spec lists them as
+# examples: this channel's entire subject is sound-blending *order* ("소리를 순서대로 이어 붙이는"),
+# so those words are a FACTUAL_CONTENT explanation, not a PAUSE/timeline structure signal, in
+# almost every real required_content item -- keeping them would misclassify working FACTUAL_CONTENT
+# coverage as STRUCTURAL_REQUIREMENT and break it (forbidden by spec section 18/42).
+_TIME_UNIT_RE = re.compile(r"\d+\s*(초|분)")
+_STRUCTURAL_PHRASES = ("생각 시간", "pause", "정답 공개 전", "공개 후", "재생", "replay")
+_INTERACTION_SIGNAL_WORDS = (
+    "직접", "시도", "읽어보", "소리 내어", "생각해", "도전", "성공 경험", "격려", "확인해보",
+)
+_STYLE_SIGNAL_WORDS = ("자연스럽", "부담 없", "친근하", "차분하", "편안하", "따뜻하", "격려하", "부드럽", "간결한")
 _FACTUAL_SIGNAL_RE = re.compile(r"[A-Za-z]{2,}|/[^/]+/|\d|예시|정답|소리|발음|제시|연결|확인")
-_ENDING_SIGNAL_WORDS = ("감사합니다", "다음 시간", "함께", "이어가", "도움이 되셨다면")
+_ENDING_SIGNAL_WORDS = ("감사합니다", "다음 시간", "다음 영상", "함께", "이어가", "도움이 되셨다면")
+_AUTHORITATIVE_TONE_BLACKLIST = (
+    "무조건 하세요", "반드시 해야 합니다", "제대로 하려면", "이것만 따라하세요",
+    "틀리면 안 됩니다", "외우세요", "당장",
+)
+_ATTEMPT_NARRATION_SIGNAL_WORDS = ("직접 읽어보", "소리를 떠올리", "소리 내어 읽어보", "시도해보", "직접 소리 내어")
+_MINI_SUCCESS_CONFIRMATION_WORDS = ("성공", "잘", "맞습니다", "읽어냈", "해냈", "좋습니다", "직접 연결", "첫 연습")
+_TIME_EXPRESSION_RE = re.compile(r"(\d+)\s*초")
 
 
 def classify_required_content_type(item: str) -> str:
+    if _TIME_UNIT_RE.search(item) or any(p in item for p in _STRUCTURAL_PHRASES):
+        return "STRUCTURAL_REQUIREMENT"
+    if any(w in item for w in _INTERACTION_SIGNAL_WORDS):
+        return "INTERACTION_REQUIREMENT"
     if _FACTUAL_SIGNAL_RE.search(item):
         return "FACTUAL_CONTENT"
     if any(w in item for w in _STYLE_SIGNAL_WORDS):
         return "STYLE_INTENT"
     return "FACTUAL_CONTENT"
+
+
+def _parse_expected_seconds(item: str) -> int | None:
+    m = _TIME_EXPRESSION_RE.search(item)
+    return int(m.group(1)) if m else None
+
+
+def _has_no_early_answer_reveal(timeline: list[dict], speech_assets_by_id: dict) -> bool:
+    pause_index = next((i for i, ev in enumerate(timeline) if ev["type"] == "PAUSE"), None)
+    if pause_index is None:
+        return True
+    for ev in timeline[:pause_index]:
+        if ev["type"] == "SPEECH":
+            asset = speech_assets_by_id.get(ev.get("speech_asset_id"))
+            if asset and asset["speech_mode"] in {"EN_NATIVE", "EN_PHONEME_DEMO"}:
+                return False
+    return True
+
+
+def _narration_text_around_pause(pb: dict, speech_assets_by_id: dict, *, before: bool) -> str:
+    timeline = pb.get("timeline") or []
+    pause_index = next((i for i, ev in enumerate(timeline) if ev["type"] == "PAUSE"), None)
+    if pause_index is None:
+        events = timeline if before else []
+    else:
+        events = timeline[:pause_index] if before else timeline[pause_index + 1:]
+    parts = []
+    for ev in events:
+        if ev["type"] != "SPEECH":
+            continue
+        asset = speech_assets_by_id.get(ev.get("speech_asset_id"))
+        if asset and asset["speech_mode"] in {"KO_NARRATION", "KO_PRONUNCIATION_GUIDE"}:
+            parts.append(str(asset.get("source_text") or ""))
+    return " ".join(parts)
+
+
+def check_structural_requirement_coverage(item: str, pb: dict, speech_assets_by_id: dict) -> tuple[str, list, str]:
+    """Timing/order requirements are proven by the timeline, never by narration text (11-2 section
+    5-7): a PAUSE event must exist, its duration_ms must match any parsed 'N초' expression exactly,
+    no answer may be revealed before it (reuses the same order logic as
+    answer_not_revealed_before_attempt -- not a duplicate verification system), and an answer event
+    (EN_NATIVE/EN_PHONEME_DEMO) must exist after it."""
+    method = "timeline_order_and_duration"
+    timeline = pb.get("timeline") or []
+    pause_events = [(i, ev) for i, ev in enumerate(timeline) if ev["type"] == "PAUSE"]
+    if not pause_events:
+        return "uncovered", [], method
+    pause_index, pause_ev = pause_events[0]
+
+    expected_seconds = _parse_expected_seconds(item)
+    if expected_seconds is not None and pause_ev.get("duration_ms") != expected_seconds * 1000:
+        return "uncovered", [], method
+
+    if not _has_no_early_answer_reveal(timeline, speech_assets_by_id):
+        return "uncovered", [], method
+
+    answer_ev = next(
+        (
+            ev for ev in timeline[pause_index + 1:]
+            if ev["type"] == "SPEECH"
+            and (speech_assets_by_id.get(ev.get("speech_asset_id")) or {}).get("speech_mode") in {"EN_NATIVE", "EN_PHONEME_DEMO"}
+        ),
+        None,
+    )
+    if answer_ev is None:
+        return "uncovered", [], method
+
+    evidence = [f"PAUSE:{pause_ev.get('duration_ms')}ms", f"SPEECH:{answer_ev['speech_asset_id']}"]
+    return "covered", evidence, method
+
+
+def check_interaction_requirement_coverage(
+    item: str, content_block: dict, pb: dict, speech_assets_by_id: dict,
+) -> tuple[str, list, str]:
+    """Viewer-action requirements are proven by viewer_action/interaction_spec/direct-action
+    narration (spec section 8), never by a bare keyword match. A 'first success' style requirement
+    (spec section 9) additionally needs the MINI_SUCCESS attempt/delay/confirmation structure and,
+    if the item asks for encouragement, a real encouragement signal in the confirmation narration --
+    never an automatic pass."""
+    interaction_spec = pb.get("interaction_spec") or {}
+    viewer_action = content_block.get("viewer_action") or interaction_spec.get("viewer_action")
+    pre_pause_text = _narration_text_around_pause(pb, speech_assets_by_id, before=True)
+    has_attempt_narration = any(sig in pre_pause_text for sig in _ATTEMPT_NARRATION_SIGNAL_WORDS)
+
+    is_mini_success_flavor = (
+        content_block.get("learning_function") == "MINI_SUCCESS"
+        or pb.get("production_intent") == "viewer_must_attempt_before_answer"
+    )
+
+    if is_mini_success_flavor:
+        method = "mini_success_attempt_and_confirmation_evidence"
+        thinking_time = content_block.get("thinking_time_seconds") or interaction_spec.get("thinking_time_seconds") or 0
+        timeline = pb.get("timeline") or []
+        pause_index = next((i for i, ev in enumerate(timeline) if ev["type"] == "PAUSE"), None)
+        has_delay_structure = thinking_time > 0 and pause_index is not None
+        post_events = timeline[pause_index + 1:] if pause_index is not None else []
+        has_confirmation = any(ev["type"] == "SPEECH" for ev in post_events)
+        if not (bool(viewer_action) and has_delay_structure and has_confirmation):
+            return "uncovered", [], method
+        if any(w in item for w in ("격려", "성공 경험")):
+            confirmation_text = _narration_text_around_pause(pb, speech_assets_by_id, before=False)
+            if not any(sig in confirmation_text for sig in _MINI_SUCCESS_CONFIRMATION_WORDS):
+                return "uncovered", [], method
+        return "covered", [f"BLOCK:{pb.get('content_block_id')}"], method
+
+    method = "viewer_action_and_narration_evidence"
+    if viewer_action or has_attempt_narration:
+        return "covered", [f"BLOCK:{pb.get('content_block_id')}"], method
+    return "uncovered", [], method
+
+
+def _authoritative_tone_absent(text: str) -> bool:
+    return not any(p in text for p in _AUTHORITATIVE_TONE_BLACKLIST)
 
 
 def _style_intent_structural_evidence(pb: dict, is_ending_block: bool, speech_assets_by_id: dict) -> list[str]:
@@ -344,14 +484,94 @@ def _style_intent_structural_evidence(pb: dict, is_ending_block: bool, speech_as
     return evidence
 
 
+def _is_style_ending_block(content_block: dict, pb: dict, is_last_production_block: bool, speech_assets_by_id: dict) -> bool:
+    """Broader than 'learning_function == RESOLUTION' alone (spec section 12) -- the real CB08 is
+    the last Production Block with a genuine closing narration, which is a strong ending signal on
+    its own even when RESOLUTION isn't set."""
+    if content_block.get("learning_function") == "RESOLUTION":
+        return True
+    if is_last_production_block:
+        return True
+    retention = content_block.get("retention_intent") or {}
+    if retention.get("type") in {"next_question", "open_loop"}:
+        return True
+    narration = _block_korean_narration_text(pb, speech_assets_by_id)
+    return any(sig in narration for sig in _ENDING_SIGNAL_WORDS)
+
+
+def check_style_intent_coverage(pb: dict, is_ending_block: bool, speech_assets_by_id: dict) -> tuple[str, list, str]:
+    """Four-axis check (spec section 11): closing role, real KO_NARRATION, closing/continuation
+    intent, and absence of an authoritative/aggressive tone violation. Never auto-passes just
+    because the block is final -- narration must actually exist and actually carry a closing
+    signal, and the blacklist must be clean."""
+    method = "closing_structure_and_tone_evidence"
+    if not is_ending_block:
+        return "uncovered", [], method
+    narration = _block_korean_narration_text(pb, speech_assets_by_id)
+    if not narration.strip():
+        return "uncovered", [], method
+    if not _authoritative_tone_absent(narration):
+        return "uncovered", [], method
+    style_evidence = _style_intent_structural_evidence(pb, is_ending_block, speech_assets_by_id)
+    if not style_evidence:
+        return "uncovered", [], method
+    evidence = [f"BLOCK:{pb.get('content_block_id')}"] + [f"SPEECH:{sid}" for sid in style_evidence]
+    return "covered", evidence, method
+
+
+def evaluate_required_content_item(
+    item: str, content_block: dict, pb: dict, speech_assets_by_id: dict,
+    lexical_matches: list, is_ending_block: bool,
+) -> dict:
+    """Single source of truth for required_content coverage (11-2 section 43): evidence source must
+    match requirement type -- TEXT->TEXT, TIMING->TIMELINE, INTERACTION->ACTION, STYLE->ROLE/TONE.
+    Never a single lexical-overlap check for anything but FACTUAL_CONTENT."""
+    item_type = classify_required_content_type(item)
+
+    if item_type == "STRUCTURAL_REQUIREMENT":
+        status, evidence, method = check_structural_requirement_coverage(item, pb, speech_assets_by_id)
+    elif item_type == "INTERACTION_REQUIREMENT":
+        status, evidence, method = check_interaction_requirement_coverage(item, content_block, pb, speech_assets_by_id)
+    elif item_type == "STYLE_INTENT":
+        status, evidence, method = check_style_intent_coverage(pb, is_ending_block, speech_assets_by_id)
+    elif lexical_matches:
+        status, evidence, method = "covered", list(lexical_matches), "content_evidence_lexical_overlap"
+    else:
+        status, evidence, method = "uncovered", [], "content_evidence_lexical_overlap"
+
+    return {
+        "required_content": item,
+        "type": item_type,
+        "status": status,
+        "evidence": evidence,
+        "method": method,
+    }
+
+
+def evaluate_all_required_content(
+    content_blocks: list[dict], production_blocks: list[dict], speech_assets_by_id: dict,
+) -> list[dict]:
+    block_by_id = {b["content_block_id"]: b for b in content_blocks}
+    max_block_order = max((pb["block_order"] for pb in production_blocks), default=0)
+    evaluations = []
+    for pb in production_blocks:
+        cb = block_by_id.get(pb["content_block_id"], {})
+        is_ending_block = _is_style_ending_block(cb, pb, pb.get("block_order") == max_block_order, speech_assets_by_id)
+        for item, matches in (pb.get("required_content_coverage") or {}).items():
+            evaluation = evaluate_required_content_item(item, cb, pb, speech_assets_by_id, matches, is_ending_block)
+            evaluation["content_block_id"] = pb["content_block_id"]
+            evaluations.append(evaluation)
+    return evaluations
+
+
 def is_required_content_covered(
     item: str, matches: list, is_ending_block: bool, production_block: dict, speech_assets_by_id: dict,
 ) -> bool:
-    if matches:
-        return True
-    if classify_required_content_type(item) != "STYLE_INTENT":
-        return False
-    return bool(_style_intent_structural_evidence(production_block, is_ending_block, speech_assets_by_id))
+    """Kept for backward compatibility with direct unit-test callers that pass a single production
+    block dict as both the content-block and production-block context. Delegates to
+    evaluate_required_content_item, the same logic the full integrity check now uses."""
+    result = evaluate_required_content_item(item, production_block, production_block, speech_assets_by_id, matches, is_ending_block)
+    return result["status"] == "covered"
 
 
 # ---------------------------------------------------------------------------
@@ -693,15 +913,9 @@ def run_planner_integrity_check(
     checks["block_order_preserved"] = "pass" if orders == sorted(orders) and len(orders) == len(set(orders)) else "fail"
 
     block_by_id = {b["content_block_id"]: b for b in content_blocks}
-    max_block_order = max((pb["block_order"] for pb in production_blocks), default=0)
 
-    missing_coverage = False
-    for pb in production_blocks:
-        cb = block_by_id.get(pb["content_block_id"], {})
-        is_ending_block = cb.get("learning_function") == "RESOLUTION" or pb.get("block_order") == max_block_order
-        for item, matches in pb.get("required_content_coverage", {}).items():
-            if not is_required_content_covered(item, matches, is_ending_block, pb, speech_assets_by_id):
-                missing_coverage = True
+    evaluations = evaluate_all_required_content(content_blocks, production_blocks, speech_assets_by_id)
+    missing_coverage = any(ev["status"] != "covered" for ev in evaluations)
     checks["required_content_covered"] = "fail" if missing_coverage else "pass"
 
     lost_viewer_action = any(
@@ -718,17 +932,9 @@ def run_planner_integrity_check(
     )
     checks["thinking_time_preserved"] = "fail" if lost_thinking_time else "pass"
 
-    revealed_early = False
-    for pb in production_blocks:
-        timeline = pb.get("timeline") or []
-        pause_index = next((i for i, ev in enumerate(timeline) if ev["type"] == "PAUSE"), None)
-        if pause_index is None:
-            continue
-        for ev in timeline[:pause_index]:
-            if ev["type"] == "SPEECH":
-                asset = speech_assets_by_id.get(ev["speech_asset_id"])
-                if asset and asset["speech_mode"] in {"EN_NATIVE", "EN_PHONEME_DEMO"}:
-                    revealed_early = True
+    revealed_early = any(
+        not _has_no_early_answer_reveal(pb.get("timeline") or [], speech_assets_by_id) for pb in production_blocks
+    )
     checks["answer_not_revealed_before_attempt"] = "fail" if revealed_early else "pass"
 
     checks["speech_mode_valid"] = "pass" if all(a["speech_mode"] in SPEECH_MODES for a in speech_assets_by_id.values()) else "fail"
@@ -960,6 +1166,7 @@ def build_production_plan(
         for pb in production_blocks if "speech_plan" in pb
     )
     planner_score = compute_planner_score(production_blocks, checks, speech_assets_by_id)
+    required_content_evaluations = evaluate_all_required_content(content_blocks, production_blocks, speech_assets_by_id)
 
     return {
         "direction_row": direction_row,
@@ -974,6 +1181,7 @@ def build_production_plan(
         "integrity_checks": checks,
         "ready_for_asset_generation": ready,
         "planner_score": planner_score,
+        "required_content_evaluations": required_content_evaluations,
     }
 
 
@@ -1108,9 +1316,12 @@ def build_production_plan_report(
 
     lines.append("## 5. Required Content Coverage")
     lines.append("")
-    for pb in result["production_blocks"]:
-        for item, matches in pb.get("required_content_coverage", {}).items():
-            lines.append(f"- [{pb['content_block_id']}] \"{item}\": {matches if matches else 'UNCOVERED'}")
+    for ev in result.get("required_content_evaluations", []):
+        status_label = "COVERED" if ev["status"] == "covered" else "UNCOVERED"
+        lines.append(
+            f"- [{ev['content_block_id']}] \"{ev['required_content']}\" ({ev['type']}): {status_label} "
+            f"(evidence={ev['evidence'] or '[]'}, method={ev['method']})"
+        )
     lines.append("")
 
     lines.append("## 6. Production Complexity")

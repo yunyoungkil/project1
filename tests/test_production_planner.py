@@ -10,6 +10,7 @@ from research.production_planner import (
     PODCAST_VOICES,
     SPEECH_MODES,
     SpeechAssetRegistry,
+    _SAFE_READ_INVITATION,
     build_block_speech_plan,
     build_caption_spec,
     build_pause_event,
@@ -18,13 +19,17 @@ from research.production_planner import (
     build_timeline,
     build_visual_spec,
     check_educational_wording_preserved,
+    check_interaction_requirement_coverage,
     check_narration_fragment_safe,
+    check_structural_requirement_coverage,
+    check_style_intent_coverage,
     classify_required_content_type,
     classify_speech_mode,
     compute_planner_score,
     compute_required_content_coverage,
     estimate_block_duration,
     estimate_production_complexity,
+    evaluate_required_content_item,
     is_orphan_narration_fragment,
     is_punctuation_only_fragment,
     is_required_content_covered,
@@ -71,13 +76,13 @@ def _bag_content_blocks():
         _block("CB04", "DEMONSTRATION", "BAT에서 T는 /t/ 소리를 냅니다.", required_content=["BAT 예시 사용"], section_number=3),
         _block("CB05", "PRACTICE", "MAP에서 M은 /m/, P는 /p/ 소리를 냅니다. 정리하면 /m/ - /æ/ - /p/ 입니다.", required_content=["MAP 예시 사용"], section_number=4),
         _block("CB06", "MINI_SUCCESS", "이 단어 CAP에서는 C가 /k/ 소리를 냅니다. 가운데 A는 /æ/, 끝 글자 P는 /p/ 소리입니다. 이 세 소리를 순서대로 직접 소리 내어 이어 붙여보세요.",
-               required_content=["CAP 예시 사용", "CAP에서 C가 /k/ 소리를 냄을 안내"],
+               required_content=["CAP 예시 사용", "CAP에서 C가 /k/ 소리를 냄을 안내", "정답 공개 전 3초 생각 시간 부여"],
                viewer_action="정답 공개 전에 CAP을 직접 읽어본다.", thinking_time_seconds=3, section_number=5),
         _block("CB07", "RECAP", "오늘 BAG, BAT, MAP, CAP을 배웠습니다.", section_number=6),
         _block("CB08", "RESOLUTION",
                "영어 단어는 외우려고 할수록 복잡해지지만, 소리가 이어지는 원리를 이해하면 훨씬 쉬워집니다. "
                "오늘 영상이 도움이 되셨다면 함께 연습을 이어가 보세요. 시청해 주셔서 감사합니다.",
-               required_content=["자연스럽고 부담 없는 마무리 인사"], section_number=None),
+               required_content=["자연스럽고 부담 없는 마무리 인사", "차분하고 권위적이지 않은 마무리 멘트"], section_number=None),
     ]
 
 
@@ -803,7 +808,9 @@ def test_case_o_ending_greeting_classified_as_style_intent():
 def test_case_r_factual_content_classification_preserved():
     assert classify_required_content_type("BAG 예시 사용") == "FACTUAL_CONTENT"
     assert classify_required_content_type("BAG에서 B는 /b/") == "FACTUAL_CONTENT"
-    assert classify_required_content_type("3초 생각 시간 후 CAP 정답 확인") == "FACTUAL_CONTENT"
+    # 11-2: time-structure wording takes priority over a bare digit -- "3초" must not be claimed by
+    # the FACTUAL digit signal just because a number happens to be present (spec section 4).
+    assert classify_required_content_type("3초 생각 시간 후 CAP 정답 확인") == "STRUCTURAL_REQUIREMENT"
 
 
 def test_case_p_style_intent_covered_with_real_ending_narration():
@@ -862,3 +869,245 @@ def test_full_bag_plan_reaches_ready_for_asset_generation(tmp_path):
     )
     en_native = {a["source_text"] for a in result["speech_assets"] if a["speech_mode"] == "EN_NATIVE"}
     assert {"BAG", "BAT", "MAP", "CAP"}.issubset(en_native)
+
+    # 11-2 CASE Y/Z/AA/AB/AC: the two previously-false-negative real items must now be covered via
+    # type-appropriate evidence, and the rest of the plan must be untouched by the fix.
+    by_item = {ev["required_content"]: ev for ev in result["required_content_evaluations"]}
+    cb06_ev = by_item["정답 공개 전 3초 생각 시간 부여"]
+    assert cb06_ev["type"] == "STRUCTURAL_REQUIREMENT"
+    assert cb06_ev["status"] == "covered"  # CASE Y
+    cb08_ev = by_item["차분하고 권위적이지 않은 마무리 멘트"]
+    assert cb08_ev["type"] == "STYLE_INTENT"
+    assert cb08_ev["status"] == "covered"  # CASE Z
+    assert checks["required_content_covered"] == "pass"  # CASE AA
+    assert len([s for s in checks.values() if s == "fail"]) == 0  # CASE AB
+    assert result["ready_for_asset_generation"] is True  # CASE AC
+    assert len(result["production_blocks"]) == 8
+    cap_pb = next(pb for pb in result["production_blocks"] if pb["content_block_id"] == "CB06")
+    cap_timeline_types = [ev["type"] for ev in cap_pb["timeline"] if ev["type"] in {"VISUAL", "PAUSE", "SPEECH"}]
+    pause_i = cap_timeline_types.index("PAUSE")
+    assert cap_timeline_types[:pause_i].count("VISUAL") >= 1
+    pause_ev = next(ev for ev in cap_pb["timeline"] if ev["type"] == "PAUSE")
+    assert pause_ev["duration_ms"] == 3000
+
+
+# ---------------------------------------------------------------------------
+# 11-2: required_content Type Classification (spec section 28, CASE A-F)
+# ---------------------------------------------------------------------------
+
+def test_case_a_11_2_factual_word_example_classified_factual():
+    assert classify_required_content_type("BAG 예시 단어 사용") == "FACTUAL_CONTENT"
+
+
+def test_case_b_11_2_time_structure_classified_structural():
+    assert classify_required_content_type("정답 공개 전 3초 생각 시간 부여") == "STRUCTURAL_REQUIREMENT"
+
+
+def test_case_c_11_2_viewer_attempt_classified_interaction():
+    assert classify_required_content_type("시청자가 직접 읽어본다") == "INTERACTION_REQUIREMENT"
+
+
+def test_case_d_11_2_tone_constraint_classified_style():
+    assert classify_required_content_type("차분하고 권위적이지 않은 마무리 멘트") == "STYLE_INTENT"
+
+
+def test_case_e_11_2_concise_wording_classified_style():
+    assert classify_required_content_type("간결한 마무리 인사") == "STYLE_INTENT"
+
+
+def test_case_f_11_2_mixed_structural_interaction_handled_without_crash():
+    result_type = classify_required_content_type("3초 생각 시간 + 직접 읽기")
+    assert result_type == "STRUCTURAL_REQUIREMENT"  # Priority 1 wins over Priority 2
+
+
+# ---------------------------------------------------------------------------
+# 11-2: STRUCTURAL_REQUIREMENT Coverage (spec section 29, CASE G-K)
+# ---------------------------------------------------------------------------
+
+def _structural_pb(pause_duration_ms, answer_before_pause=False, include_visual=True, include_pause=True):
+    registry = SpeechAssetRegistry()
+    visual_asset = registry.get_or_create("EN_NATIVE", NARRATOR_VOICE, "CAP")
+    events = []
+    order = 1
+    if answer_before_pause:
+        events.append({"event_order": order, "type": "SPEECH", "speech_asset_id": visual_asset})
+        order += 1
+    if include_visual:
+        events.append({"event_order": order, "type": "VISUAL", "visual_role": "TARGET_WORD", "content": "CAP"})
+        order += 1
+    if include_pause:
+        events.append({"event_order": order, "type": "PAUSE", "duration_ms": pause_duration_ms, "pause_visual_behavior": "THINKING_DOTS"})
+        order += 1
+    if not answer_before_pause:
+        events.append({"event_order": order, "type": "SPEECH", "speech_asset_id": visual_asset})
+        order += 1
+    pb = {"content_block_id": "CB06", "block_order": 1, "timeline": events}
+    return pb, registry.by_id()
+
+
+def test_case_g_pause_3000ms_with_answer_after_covered():
+    pb, assets = _structural_pb(3000)
+    status, evidence, method = check_structural_requirement_coverage("정답 공개 전 3초 생각 시간 부여", pb, assets)
+    assert status == "covered"
+    assert evidence
+    assert method == "timeline_order_and_duration"
+
+
+def test_case_h_pause_1000ms_for_3_second_requirement_fails():
+    pb, assets = _structural_pb(1000)
+    status, _, _ = check_structural_requirement_coverage("정답 공개 전 3초 생각 시간 부여", pb, assets)
+    assert status == "uncovered"
+
+
+def test_case_i_answer_before_pause_fails():
+    pb, assets = _structural_pb(3000, answer_before_pause=True)
+    status, _, _ = check_structural_requirement_coverage("정답 공개 전 3초 생각 시간 부여", pb, assets)
+    assert status == "uncovered"
+
+
+def test_case_j_visual_then_pause_then_answer_passes():
+    pb, assets = _structural_pb(3000, include_visual=True)
+    status, evidence, _ = check_structural_requirement_coverage("정답 공개 전 3초 생각 시간 부여", pb, assets)
+    assert status == "covered"
+
+
+def test_case_k_thinking_time_metadata_without_timeline_pause_fails():
+    pb, assets = _structural_pb(3000, include_pause=False)
+    status, _, _ = check_structural_requirement_coverage("정답 공개 전 3초 생각 시간 부여", pb, assets)
+    assert status == "uncovered"
+
+
+# ---------------------------------------------------------------------------
+# 11-2: INTERACTION_REQUIREMENT Coverage (spec section 30, CASE L-O)
+# ---------------------------------------------------------------------------
+
+def test_case_l_viewer_action_and_attempt_narration_covered():
+    registry = SpeechAssetRegistry()
+    asset_id = registry.get_or_create("KO_NARRATION", NARRATOR_VOICE, _SAFE_READ_INVITATION)
+    pb = {
+        "content_block_id": "CB06", "timeline": [{"event_order": 1, "type": "SPEECH", "speech_asset_id": asset_id}],
+        "interaction_spec": {"viewer_action": "직접 읽어본다"}, "production_intent": None,
+    }
+    content_block = {"viewer_action": "직접 읽어본다", "learning_function": "PRACTICE"}
+    status, evidence, _ = check_interaction_requirement_coverage("시청자 스스로 소리 조합 시도 안내", content_block, pb, registry.by_id())
+    assert status == "covered"
+    assert evidence
+
+
+def test_case_m_no_viewer_action_no_attempt_narration_fails():
+    pb = {"content_block_id": "CB06", "timeline": [], "interaction_spec": {}, "production_intent": None}
+    content_block = {"viewer_action": None, "learning_function": "CORE_EXPLANATION"}
+    status, _, _ = check_interaction_requirement_coverage("시청자 스스로 소리 조합 시도 안내", content_block, pb, {})
+    assert status == "uncovered"
+
+
+def test_case_n_mini_success_full_structure_covered():
+    registry = SpeechAssetRegistry()
+    en_asset = registry.get_or_create("EN_NATIVE", NARRATOR_VOICE, "CAP")
+    confirm_asset = registry.get_or_create("KO_NARRATION", NARRATOR_VOICE, "정말 잘 읽어냈습니다, 성공입니다.")
+    timeline = [
+        {"event_order": 1, "type": "PAUSE", "duration_ms": 3000, "pause_visual_behavior": "THINKING_DOTS"},
+        {"event_order": 2, "type": "SPEECH", "speech_asset_id": en_asset},
+        {"event_order": 3, "type": "SPEECH", "speech_asset_id": confirm_asset},
+    ]
+    pb = {"content_block_id": "CB06", "timeline": timeline, "interaction_spec": {"viewer_action": "직접 읽어본다"}, "production_intent": None}
+    content_block = {"viewer_action": "직접 읽어본다", "learning_function": "MINI_SUCCESS", "thinking_time_seconds": 3}
+    status, evidence, method = check_interaction_requirement_coverage("시청자의 첫 읽기 성공 경험 격려", content_block, pb, registry.by_id())
+    assert status == "covered"
+    assert method == "mini_success_attempt_and_confirmation_evidence"
+
+
+def test_case_o_mini_success_label_without_real_attempt_fails():
+    pb = {"content_block_id": "CB06", "timeline": [], "interaction_spec": {}, "production_intent": None}
+    content_block = {"viewer_action": None, "learning_function": "MINI_SUCCESS", "thinking_time_seconds": 0}
+    status, _, _ = check_interaction_requirement_coverage("시청자의 첫 읽기 성공 경험 격려", content_block, pb, {})
+    assert status == "uncovered"
+
+
+# ---------------------------------------------------------------------------
+# 11-2: STYLE_INTENT Coverage (spec section 31, CASE P-T)
+# ---------------------------------------------------------------------------
+
+def test_case_p_final_block_natural_closing_no_blacklist_covered():
+    registry = SpeechAssetRegistry()
+    asset_id = registry.get_or_create("KO_NARRATION", NARRATOR_VOICE, "다음 시간에도 함께 확인해 보겠습니다.")
+    pb = {"content_block_id": "CB08", "timeline": [{"event_order": 1, "type": "SPEECH", "speech_asset_id": asset_id}]}
+    status, evidence, _ = check_style_intent_coverage(pb, True, registry.by_id())
+    assert status == "covered"
+    assert evidence
+
+
+def test_case_q_no_final_block_narration_fails():
+    pb = {"content_block_id": "CB08", "timeline": []}
+    status, _, _ = check_style_intent_coverage(pb, True, {})
+    assert status == "uncovered"
+
+
+def test_case_r_authoritative_tone_fails_style_requirement():
+    registry = SpeechAssetRegistry()
+    asset_id = registry.get_or_create("KO_NARRATION", NARRATOR_VOICE, "무조건 하세요. 반드시 해야 합니다. 다음 시간에 만나요.")
+    pb = {"content_block_id": "CB08", "timeline": [{"event_order": 1, "type": "SPEECH", "speech_asset_id": asset_id}]}
+    status, _, _ = check_style_intent_coverage(pb, True, registry.by_id())
+    assert status == "uncovered"
+
+
+def test_case_s_concise_closing_covered():
+    registry = SpeechAssetRegistry()
+    asset_id = registry.get_or_create("KO_NARRATION", NARRATOR_VOICE, "시청해 주셔서 감사합니다.")
+    pb = {"content_block_id": "CB08", "timeline": [{"event_order": 1, "type": "SPEECH", "speech_asset_id": asset_id}]}
+    status, _, _ = check_style_intent_coverage(pb, True, registry.by_id())
+    assert status == "covered"
+
+
+def test_case_t_style_intent_type_alone_never_auto_covers():
+    registry = SpeechAssetRegistry()
+    asset_id = registry.get_or_create("KO_NARRATION", NARRATOR_VOICE, "그럼 다음 문제로 넘어가겠습니다.")
+    pb = {"content_block_id": "CB08", "timeline": [{"event_order": 1, "type": "SPEECH", "speech_asset_id": asset_id}]}
+    status, _, _ = check_style_intent_coverage(pb, True, registry.by_id())
+    assert status == "uncovered"
+
+
+# ---------------------------------------------------------------------------
+# 11-2: Existing Factual Coverage regression (spec section 32, CASE U-X)
+# ---------------------------------------------------------------------------
+
+def test_case_u_bag_example_coverage_still_passes():
+    block = _block("CB03", "CORE_EXPLANATION", "BAG 예시를 봅니다.", required_content=["BAG 예시"])
+    registry = SpeechAssetRegistry()
+    plan = build_block_speech_plan(block, registry)
+    timeline = build_timeline(block, plan)
+    coverage = compute_required_content_coverage(block, timeline, registry.by_id())
+    evaluation = evaluate_required_content_item("BAG 예시", block, {"content_block_id": "CB03", "timeline": timeline}, registry.by_id(), coverage["BAG 예시"], False)
+    assert evaluation["type"] == "FACTUAL_CONTENT"
+    assert evaluation["status"] == "covered"
+
+
+def test_case_v_phoneme_breakdown_coverage_still_passes():
+    block = next(b for b in _bag_content_blocks() if b["content_block_id"] == "CB03")
+    registry = SpeechAssetRegistry()
+    plan = build_block_speech_plan(block, registry)
+    timeline = build_timeline(block, plan)
+    coverage = compute_required_content_coverage(block, timeline, registry.by_id())
+    assert coverage["B /b/ A /æ/ G /g/ 음소 제시"]
+
+
+def test_case_w_cap_target_coverage_still_passes():
+    block = next(b for b in _bag_content_blocks() if b["content_block_id"] == "CB06")
+    registry = SpeechAssetRegistry()
+    plan = build_block_speech_plan(block, registry)
+    timeline = build_timeline(block, plan)
+    coverage = compute_required_content_coverage(block, timeline, registry.by_id())
+    assert coverage["CAP 예시 사용"]
+
+
+def test_case_x_missing_factual_target_still_fails():
+    block = _block("CB03", "CORE_EXPLANATION", "BAG 예시를 봅니다.", required_content=["완전히 다른 단어 목록 확인"])
+    registry = SpeechAssetRegistry()
+    plan = build_block_speech_plan(block, registry)
+    timeline = build_timeline(block, plan)
+    coverage = compute_required_content_coverage(block, timeline, registry.by_id())
+    evaluation = evaluate_required_content_item(
+        "완전히 다른 단어 목록 확인", block, {"content_block_id": "CB03", "timeline": timeline}, registry.by_id(),
+        coverage["완전히 다른 단어 목록 확인"], False,
+    )
+    assert evaluation["status"] == "uncovered"
