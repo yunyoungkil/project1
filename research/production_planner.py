@@ -15,6 +15,7 @@ from datetime import date
 from pathlib import Path
 
 from research.db import connect
+from research.production_blueprint import _scope_safe_over_texts
 from research.script_writer import (
     ENGLISH_WORDS_PER_MINUTE,
     KOREAN_CHARS_PER_SECOND,
@@ -188,6 +189,172 @@ def classify_speech_mode(kind: str, korean_text: str = "", has_native_audio_sour
 
 
 # ---------------------------------------------------------------------------
+# normalize_fragments (11-1 spec sections 5-8, 20-22): a fragment that must never reach TTS --
+# punctuation-only ("-" left over from joining phonemes with a dash) or empty after stripping.
+# Deliberately does NOT merge short fragments by length (section 22 explicitly forbids a
+# len(text) < N -> merge rule); the CB06-style broken-Korean-particle case is instead prevented at
+# the source by build_block_speech_plan's answer-hiding safe template, not by stitching fragments
+# back together here.
+# ---------------------------------------------------------------------------
+
+_FRAGMENT_PUNCTUATION_CHARS = " \t\r\n-–—.,!?:;|/+→=·…\"'“”‘’()[]"
+_PUNCTUATION_ONLY_RE = re.compile(r"^[" + re.escape(_FRAGMENT_PUNCTUATION_CHARS) + r"]*$")
+
+
+def is_punctuation_only_fragment(text: str) -> bool:
+    """True for '', '-', '--', ' , ', '...' etc. False for real linguistic content -- including
+    IPA like '/æ/', since the vowel/consonant character itself is never in the punctuation set."""
+    return bool(_PUNCTUATION_ONLY_RE.match(text or ""))
+
+
+def normalize_fragments(tokens: list[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    for tok in tokens:
+        text = (tok.get("text") or "").strip()
+        if not text:
+            continue
+        if tok["kind"] == "KOREAN" and is_punctuation_only_fragment(text):
+            continue
+        normalized.append({"kind": tok["kind"], "text": text})
+    return normalized
+
+
+# ---------------------------------------------------------------------------
+# narration_fragment_safe (spec section 9): a conservative, non-NLU backstop for Korean fragments
+# that grammatically depend on a noun/target that segmentation dropped -- e.g. "가 있습니다." or "에서 첫 글자 C는"
+# with the referent word gone from the sentence entirely. This is not the same as a KO_NARRATION
+# fragment that simply follows its target word in an *adjacent* speech asset (e.g. "MAP" spoken,
+# then "에서 M은" spoken next) -- that adjacency case is the pre-existing, documented segmentation
+# limitation (see the module docstring / report Known Limitations), not a regression this backstop
+# is meant to catch.
+# ---------------------------------------------------------------------------
+
+_ORPHAN_START_PATTERNS = (
+    "가 있습니다", "이 있습니다", "에서 ", "의 ", "를 ", "을 ", "은 ", "는 ", "이 ", "가 ", ",", ".", "-",
+)
+
+
+def is_orphan_narration_fragment(text: str) -> bool:
+    stripped = (text or "").strip()
+    return any(stripped.startswith(p) for p in _ORPHAN_START_PATTERNS)
+
+
+def _fragment_has_safe_preceding_context(timeline: list[dict], index: int, speech_assets_by_id: dict) -> bool:
+    if index <= 0:
+        return False
+    prev_ev = timeline[index - 1]
+    if prev_ev["type"] == "VISUAL":
+        return True
+    if prev_ev["type"] == "SPEECH":
+        prev_asset = speech_assets_by_id.get(prev_ev.get("speech_asset_id"))
+        if prev_asset and prev_asset["speech_mode"] in {"EN_NATIVE", "EN_PHONEME_DEMO", "ORIGINAL_NATIVE_AUDIO"}:
+            return True
+    return False
+
+
+def check_narration_fragment_safe(production_blocks: list[dict], speech_assets_by_id: dict) -> str:
+    for pb in production_blocks:
+        timeline = pb.get("timeline") or []
+        for i, ev in enumerate(timeline):
+            if ev["type"] != "SPEECH":
+                continue
+            asset = speech_assets_by_id.get(ev.get("speech_asset_id"))
+            if not asset or asset["speech_mode"] != "KO_NARRATION":
+                continue
+            if not is_orphan_narration_fragment(asset.get("source_text") or ""):
+                continue
+            if not _fragment_has_safe_preceding_context(timeline, i, speech_assets_by_id):
+                return "fail"
+    return "pass"
+
+
+# ---------------------------------------------------------------------------
+# educational_wording_preserved (spec sections 2-4, 28C): 11 must not reintroduce educational
+# generalizations that upper stages already corrected away from -- "각 글자가 고유한 소리" (letter =
+# one fixed sound) and its relatives, even when a scoping phrase like "이 단어에서" is nearby (that
+# soft-scope exception is what let this exact phrasing slip past the 08/09 scope check before).
+# Reuses production_blueprint's shared _scope_safe_over_texts for the general letter-sound-claim
+# check per spec section 3's "example_scope_safe 재사용" instruction.
+# ---------------------------------------------------------------------------
+
+_DANGEROUS_WORDING_PATTERNS = (
+    "고유한 소리", "정해진 소리", "항상 이 소리", "글자는 원래 이 소리", "무조건 이 소리",
+)
+
+
+def _dangerous_wording_free(texts: list[str]) -> str:
+    for text in texts:
+        if any(p in text for p in _DANGEROUS_WORDING_PATTERNS):
+            return "fail"
+    return "pass"
+
+
+def _block_korean_narration_text(pb: dict, speech_assets_by_id: dict) -> str:
+    parts = []
+    for ev in pb.get("timeline") or []:
+        if ev["type"] != "SPEECH":
+            continue
+        asset = speech_assets_by_id.get(ev.get("speech_asset_id"))
+        if asset and asset["speech_mode"] in {"KO_NARRATION", "KO_PRONUNCIATION_GUIDE"}:
+            parts.append(str(asset.get("source_text") or ""))
+    return " ".join(parts)
+
+
+def check_educational_wording_preserved(production_blocks: list[dict], speech_assets_by_id: dict) -> str:
+    texts = [_block_korean_narration_text(pb, speech_assets_by_id) for pb in production_blocks]
+    texts = [t for t in texts if t]
+    if _dangerous_wording_free(texts) == "fail":
+        return "fail"
+    return _scope_safe_over_texts(texts)
+
+
+# ---------------------------------------------------------------------------
+# required_content coverage type classification (spec sections 15-19): FACTUAL_CONTENT items are
+# checked by lexical overlap as before; STYLE_INTENT items (tone/manner, no concrete
+# content/target) instead need structural evidence -- an Ending/Resolution block with real
+# KO_NARRATION containing an actual ending/greeting/continuation signal.
+# ---------------------------------------------------------------------------
+
+_STYLE_SIGNAL_WORDS = ("자연스럽", "부담 없", "친근하", "차분하", "편안하", "따뜻하", "격려")
+_FACTUAL_SIGNAL_RE = re.compile(r"[A-Za-z]{2,}|/[^/]+/|\d|예시|정답|소리|발음|제시|연결|확인")
+_ENDING_SIGNAL_WORDS = ("감사합니다", "다음 시간", "함께", "이어가", "도움이 되셨다면")
+
+
+def classify_required_content_type(item: str) -> str:
+    if _FACTUAL_SIGNAL_RE.search(item):
+        return "FACTUAL_CONTENT"
+    if any(w in item for w in _STYLE_SIGNAL_WORDS):
+        return "STYLE_INTENT"
+    return "FACTUAL_CONTENT"
+
+
+def _style_intent_structural_evidence(pb: dict, is_ending_block: bool, speech_assets_by_id: dict) -> list[str]:
+    if not is_ending_block:
+        return []
+    evidence = []
+    for ev in pb.get("timeline") or []:
+        if ev["type"] != "SPEECH":
+            continue
+        asset = speech_assets_by_id.get(ev.get("speech_asset_id"))
+        if not asset or asset["speech_mode"] != "KO_NARRATION":
+            continue
+        text = str(asset.get("source_text") or "")
+        if any(sig in text for sig in _ENDING_SIGNAL_WORDS):
+            evidence.append(ev["speech_asset_id"])
+    return evidence
+
+
+def is_required_content_covered(
+    item: str, matches: list, is_ending_block: bool, production_block: dict, speech_assets_by_id: dict,
+) -> bool:
+    if matches:
+        return True
+    if classify_required_content_type(item) != "STYLE_INTENT":
+        return False
+    return bool(_style_intent_structural_evidence(production_block, is_ending_block, speech_assets_by_id))
+
+
+# ---------------------------------------------------------------------------
 # Speech Asset registry (dedup, spec section 32)
 # ---------------------------------------------------------------------------
 
@@ -252,10 +419,22 @@ def build_pause_event(content_block: dict) -> dict | None:
 # word's pronunciation and its phoneme breakdown) strictly after the pause. The word's first
 # mention becomes a VISUAL prompt (text shown, not spoken) instead, matching spec section 36's
 # worked example (VISUAL CAP before PAUSE, spoken EN_NATIVE CAP only after).
+#
+# 11-1: naively deleting the ENGLISH_WORD/PHONEME tokens from the original narration and stitching
+# whatever Korean chunks were left (the old approach) breaks the sentence -- "CAP에서 C가 /k/
+# 소리를..." with CAP and /k/ removed leaves orphans like "에서 첫 글자 C는" with no referent at
+# all. Token deletion is banned for answer hiding (spec section 11); instead the pre/transition
+# narration uses a fixed, content-agnostic safe template (spec section 12) that never mentions the
+# target word or its sounds, so there is nothing to accidentally leak or fragment.
 # ---------------------------------------------------------------------------
 
+_SAFE_TURN_ANNOUNCEMENT = "이제 여러분 차례입니다."
+_SAFE_READ_INVITATION = "화면에 나온 단어를 보고, 앞에서 연습한 소리를 떠올리며 직접 읽어보세요."
+_SAFE_ANSWER_TRANSITION = "이번에는 소리를 하나씩 확인해보겠습니다."
+
+
 def build_block_speech_plan(content_block: dict, registry: SpeechAssetRegistry, has_native_audio_source: bool = False) -> dict:
-    tokens = segment_narration(content_block.get("base_narration") or "")
+    tokens = normalize_fragments(segment_narration(content_block.get("base_narration") or ""))
     thinking_time = content_block.get("thinking_time_seconds") or 0
     has_pause = bool(content_block.get("viewer_action")) and thinking_time > 0
 
@@ -268,6 +447,10 @@ def build_block_speech_plan(content_block: dict, registry: SpeechAssetRegistry, 
         asset_id = registry.get_or_create(speech_mode, voice, tok["text"])
         return {"speech_asset_id": asset_id, "speech_mode": speech_mode, "text": tok["text"]}
 
+    def _safe_narration(text: str) -> dict:
+        asset_id = registry.get_or_create("KO_NARRATION", NARRATOR_VOICE, text)
+        return {"speech_asset_id": asset_id, "speech_mode": "KO_NARRATION", "text": text}
+
     if not has_pause:
         return {
             "pre_pause": [_resolve(t) for t in tokens],
@@ -276,7 +459,6 @@ def build_block_speech_plan(content_block: dict, registry: SpeechAssetRegistry, 
             "pause_event": None,
         }
 
-    korean_tokens = [t for t in tokens if t["kind"] == "KOREAN"]
     practice_tokens = [t for t in tokens if t["kind"] in ("PHONEME", "ENGLISH_WORD")]
 
     visual_word = None
@@ -287,10 +469,17 @@ def build_block_speech_plan(content_block: dict, registry: SpeechAssetRegistry, 
             continue
         remaining_practice.append(t)
 
+    post_pause = []
+    if visual_word:
+        post_pause.append(_resolve({"kind": "ENGLISH_WORD", "text": visual_word}))
+    if remaining_practice:
+        post_pause.append(_safe_narration(_SAFE_ANSWER_TRANSITION))
+    post_pause.extend(_resolve(t) for t in remaining_practice)
+
     return {
-        "pre_pause": [_resolve(t) for t in korean_tokens],
+        "pre_pause": [_safe_narration(_SAFE_TURN_ANNOUNCEMENT), _safe_narration(_SAFE_READ_INVITATION)],
         "visual_word": visual_word,
-        "post_pause": [_resolve(t) for t in remaining_practice],
+        "post_pause": post_pause,
         "pause_event": build_pause_event(content_block),
     }
 
@@ -503,13 +692,18 @@ def run_planner_integrity_check(
     orders = [pb["block_order"] for pb in production_blocks]
     checks["block_order_preserved"] = "pass" if orders == sorted(orders) and len(orders) == len(set(orders)) else "fail"
 
-    missing_coverage = any(
-        any(not matches for matches in pb.get("required_content_coverage", {}).values())
-        for pb in production_blocks
-    )
+    block_by_id = {b["content_block_id"]: b for b in content_blocks}
+    max_block_order = max((pb["block_order"] for pb in production_blocks), default=0)
+
+    missing_coverage = False
+    for pb in production_blocks:
+        cb = block_by_id.get(pb["content_block_id"], {})
+        is_ending_block = cb.get("learning_function") == "RESOLUTION" or pb.get("block_order") == max_block_order
+        for item, matches in pb.get("required_content_coverage", {}).items():
+            if not is_required_content_covered(item, matches, is_ending_block, pb, speech_assets_by_id):
+                missing_coverage = True
     checks["required_content_covered"] = "fail" if missing_coverage else "pass"
 
-    block_by_id = {b["content_block_id"]: b for b in content_blocks}
     lost_viewer_action = any(
         block_by_id.get(pb["content_block_id"], {}).get("viewer_action")
         and not (pb.get("interaction_spec") or {}).get("viewer_action")
@@ -622,6 +816,17 @@ def run_planner_integrity_check(
     text_blob_parts.extend(str(pb.get("production_intent") or "") for pb in production_blocks)
     blob = " ".join(text_blob_parts)
     checks["no_renderer_specific_instruction"] = "fail" if any(p in blob for p in _FORMAT_LEAKAGE_PATTERNS) else "pass"
+
+    # 11-1 additions (spec section 28): punctuation-only Speech Assets, grammatically orphaned
+    # Korean fragments, and educational wording that 11 must not have reintroduced.
+    checks["speech_fragment_integrity_safe"] = "fail" if any(
+        is_punctuation_only_fragment(a.get("source_text") or "")
+        for a in speech_assets_by_id.values() if a["speech_mode"] != "EN_PHONEME_DEMO"
+    ) else "pass"
+
+    checks["narration_fragment_safe"] = check_narration_fragment_safe(production_blocks, speech_assets_by_id)
+
+    checks["educational_wording_preserved"] = check_educational_wording_preserved(production_blocks, speech_assets_by_id)
 
     return checks
 

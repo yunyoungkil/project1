@@ -17,11 +17,18 @@ from research.production_planner import (
     build_production_plan_report,
     build_timeline,
     build_visual_spec,
+    check_educational_wording_preserved,
+    check_narration_fragment_safe,
+    classify_required_content_type,
     classify_speech_mode,
     compute_planner_score,
     compute_required_content_coverage,
     estimate_block_duration,
     estimate_production_complexity,
+    is_orphan_narration_fragment,
+    is_punctuation_only_fragment,
+    is_required_content_covered,
+    normalize_fragments,
     ready_for_asset_generation_gate,
     run_planner_integrity_check,
     segment_narration,
@@ -59,15 +66,18 @@ def _bag_content_blocks():
     return [
         _block("CB01", "PROBLEM_RECOGNITION", "B, A, G. 알파벳 이름을 다 아는데 왜 안 읽힐까요?", section_number=None),
         _block("CB02", "CONTRAST", "글자 이름과 소리는 다릅니다.", section_number=1),
-        _block("CB03", "CORE_EXPLANATION", "BAG에서 글자 소리를 하나씩 살펴보겠습니다. 이 단어에서 B는 /b/ 소리를 냅니다. 그리고 가운데 A는 /æ/ 소리를 냅니다. 마지막 G는 /g/ 소리를 냅니다. 이제 이어 붙이면 BAG가 됩니다.",
+        _block("CB03", "CORE_EXPLANATION", "BAG에서 글자 소리를 하나씩 살펴보겠습니다. 이 단어에서 B는 /b/ 소리를 냅니다. 그리고 가운데 A는 /æ/ 소리를 냅니다. 마지막 G는 /g/ 소리를 냅니다. 이제 이어 붙이면 BAG가 됩니다. 정리하면 /b/ - /æ/ - /g/ 입니다.",
                required_content=["BAG 예시 사용", "B /b/ A /æ/ G /g/ 음소 제시"], section_number=2),
         _block("CB04", "DEMONSTRATION", "BAT에서 T는 /t/ 소리를 냅니다.", required_content=["BAT 예시 사용"], section_number=3),
-        _block("CB05", "PRACTICE", "MAP에서 M은 /m/, P는 /p/ 소리를 냅니다.", required_content=["MAP 예시 사용"], section_number=4),
+        _block("CB05", "PRACTICE", "MAP에서 M은 /m/, P는 /p/ 소리를 냅니다. 정리하면 /m/ - /æ/ - /p/ 입니다.", required_content=["MAP 예시 사용"], section_number=4),
         _block("CB06", "MINI_SUCCESS", "이 단어 CAP에서는 C가 /k/ 소리를 냅니다. 가운데 A는 /æ/, 끝 글자 P는 /p/ 소리입니다. 이 세 소리를 순서대로 직접 소리 내어 이어 붙여보세요.",
                required_content=["CAP 예시 사용", "CAP에서 C가 /k/ 소리를 냄을 안내"],
                viewer_action="정답 공개 전에 CAP을 직접 읽어본다.", thinking_time_seconds=3, section_number=5),
         _block("CB07", "RECAP", "오늘 BAG, BAT, MAP, CAP을 배웠습니다.", section_number=6),
-        _block("CB08", "RESOLUTION", "영어는 이해할수록 쉬워집니다.", section_number=None),
+        _block("CB08", "RESOLUTION",
+               "영어 단어는 외우려고 할수록 복잡해지지만, 소리가 이어지는 원리를 이해하면 훨씬 쉬워집니다. "
+               "오늘 영상이 도움이 되셨다면 함께 연습을 이어가 보세요. 시청해 주셔서 감사합니다.",
+               required_content=["자연스럽고 부담 없는 마무리 인사"], section_number=None),
     ]
 
 
@@ -589,3 +599,266 @@ def test_upstream_data_unchanged_by_plan_build(tmp_path):
             for t in ("topic_candidates", "click_analysis_topics", "content_packages", "production_blueprints", "video_scripts", "video_directions", "block_directions")
         }
     assert before == after
+
+
+# ---------------------------------------------------------------------------
+# 11-1: speech_fragment_integrity_safe -- punctuation-only Speech Assets (spec section 31, CASE A-D)
+# ---------------------------------------------------------------------------
+
+def test_case_a_dash_only_source_text_fails_speech_fragment_integrity():
+    registry = SpeechAssetRegistry()
+    registry.get_or_create("KO_NARRATION", NARRATOR_VOICE, "-")
+    checks = run_planner_integrity_check([], "EDUCATION", [], registry.by_id(), {}, True)
+    assert checks["speech_fragment_integrity_safe"] == "fail"
+
+
+def test_case_b_whitespace_comma_only_fails_speech_fragment_integrity():
+    registry = SpeechAssetRegistry()
+    registry.get_or_create("KO_NARRATION", NARRATOR_VOICE, " , ")
+    checks = run_planner_integrity_check([], "EDUCATION", [], registry.by_id(), {}, True)
+    assert checks["speech_fragment_integrity_safe"] == "fail"
+
+
+def test_case_c_ipa_not_mistaken_for_punctuation():
+    assert is_punctuation_only_fragment("/æ/") is False
+    registry = SpeechAssetRegistry()
+    registry.get_or_create("EN_PHONEME_DEMO", NARRATOR_VOICE, "/æ/")
+    checks = run_planner_integrity_check([], "EDUCATION", [], registry.by_id(), {}, True)
+    assert checks["speech_fragment_integrity_safe"] == "pass"
+
+
+def test_case_d_normalize_fragments_drops_empty_and_punctuation_only():
+    tokens = [
+        {"kind": "KOREAN", "text": "  "},
+        {"kind": "KOREAN", "text": "-"},
+        {"kind": "KOREAN", "text": ""},
+        {"kind": "PHONEME", "text": "/b/"},
+        {"kind": "KOREAN", "text": "실제 내용입니다"},
+    ]
+    normalized = normalize_fragments(tokens)
+    assert normalized == [{"kind": "PHONEME", "text": "/b/"}, {"kind": "KOREAN", "text": "실제 내용입니다"}]
+
+
+def test_case_e_cb03_dash_between_phonemes_produces_no_dash_asset():
+    block = next(b for b in _bag_content_blocks() if b["content_block_id"] == "CB03")
+    registry = SpeechAssetRegistry()
+    plan = build_block_speech_plan(block, registry)
+    all_segments = plan["pre_pause"] + plan["post_pause"]
+    assert not any(seg["text"].strip() == "-" for seg in all_segments)
+    assert not any(is_punctuation_only_fragment(seg["text"]) for seg in all_segments)
+
+
+def test_case_f_cb05_dash_between_phonemes_produces_no_dash_asset():
+    block = next(b for b in _bag_content_blocks() if b["content_block_id"] == "CB05")
+    registry = SpeechAssetRegistry()
+    plan = build_block_speech_plan(block, registry)
+    all_segments = plan["pre_pause"] + plan["post_pause"]
+    assert not any(seg["text"].strip() == "-" for seg in all_segments)
+    assert not any(is_punctuation_only_fragment(seg["text"]) for seg in all_segments)
+
+
+# ---------------------------------------------------------------------------
+# 11-1: narration_fragment_safe -- orphaned Korean fragments from answer hiding (CASE G-N)
+# ---------------------------------------------------------------------------
+
+def test_case_g_orphan_fragment_missing_subject_detected():
+    assert is_orphan_narration_fragment("가 있습니다.") is True
+
+
+def test_case_h_orphan_fragment_missing_referent_detected():
+    assert is_orphan_narration_fragment("에서 첫 글자 C는") is True
+
+
+def test_case_i_normal_narration_not_flagged_as_orphan():
+    assert is_orphan_narration_fragment("이번에는 소리를 하나씩 확인해보겠습니다.") is False
+
+
+def test_case_j_cap_safe_reconstruction_has_no_orphan_speech():
+    block = next(b for b in _bag_content_blocks() if b["content_block_id"] == "CB06")
+    registry = SpeechAssetRegistry()
+    plan = build_block_speech_plan(block, registry)
+    timeline = build_timeline(block, plan)
+    production_blocks = [{"content_block_id": "CB06", "block_order": 1, "timeline": timeline}]
+    assert check_narration_fragment_safe(production_blocks, registry.by_id()) == "pass"
+
+
+def test_case_k_cap_visual_before_pause():
+    block = next(b for b in _bag_content_blocks() if b["content_block_id"] == "CB06")
+    registry = SpeechAssetRegistry()
+    plan = build_block_speech_plan(block, registry)
+    timeline = build_timeline(block, plan)
+    pause_idx = next(i for i, ev in enumerate(timeline) if ev["type"] == "PAUSE")
+    visual_idx = next(i for i, ev in enumerate(timeline) if ev["type"] == "VISUAL")
+    assert visual_idx < pause_idx
+    assert timeline[visual_idx]["content"] == "CAP"
+
+
+def test_case_l_cap_en_native_answer_only_after_pause():
+    block = next(b for b in _bag_content_blocks() if b["content_block_id"] == "CB06")
+    registry = SpeechAssetRegistry()
+    plan = build_block_speech_plan(block, registry)
+    timeline = build_timeline(block, plan)
+    pause_idx = next(i for i, ev in enumerate(timeline) if ev["type"] == "PAUSE")
+    en_native_indices = [
+        i for i, ev in enumerate(timeline)
+        if ev["type"] == "SPEECH" and registry.by_id()[ev["speech_asset_id"]]["speech_mode"] == "EN_NATIVE"
+    ]
+    assert en_native_indices
+    assert all(i > pause_idx for i in en_native_indices)
+    assert any(registry.by_id()[timeline[i]["speech_asset_id"]]["source_text"] == "CAP" for i in en_native_indices)
+
+
+def test_case_m_cap_answer_phonemes_only_after_pause():
+    block = next(b for b in _bag_content_blocks() if b["content_block_id"] == "CB06")
+    registry = SpeechAssetRegistry()
+    plan = build_block_speech_plan(block, registry)
+    timeline = build_timeline(block, plan)
+    pause_idx = next(i for i, ev in enumerate(timeline) if ev["type"] == "PAUSE")
+    phoneme_indices = [
+        i for i, ev in enumerate(timeline)
+        if ev["type"] == "SPEECH" and registry.by_id()[ev["speech_asset_id"]]["speech_mode"] == "EN_PHONEME_DEMO"
+    ]
+    assert {registry.by_id()[timeline[i]["speech_asset_id"]]["source_text"] for i in phoneme_indices} == {"/k/", "/æ/", "/p/"}
+    assert all(i > pause_idx for i in phoneme_indices)
+
+
+def test_case_n_cap_thinking_time_3000ms_preserved_in_new_structure():
+    block = next(b for b in _bag_content_blocks() if b["content_block_id"] == "CB06")
+    registry = SpeechAssetRegistry()
+    plan = build_block_speech_plan(block, registry)
+    timeline = build_timeline(block, plan)
+    pause_ev = next(ev for ev in timeline if ev["type"] == "PAUSE")
+    assert pause_ev["duration_ms"] == 3000
+
+
+def test_orphan_fragment_with_no_safe_preceding_context_fails_check():
+    # Sabotage: an orphan-looking fragment with a plain KOREAN predecessor (no adjacent
+    # English/phoneme/visual context) -- the actual CB06-style regression shape.
+    registry = SpeechAssetRegistry()
+    first_id = registry.get_or_create("KO_NARRATION", NARRATOR_VOICE, "모자를 뜻하는 단어가 있습니다.")
+    orphan_id = registry.get_or_create("KO_NARRATION", NARRATOR_VOICE, "에서 첫 글자 C는")
+    timeline = [
+        {"event_order": 1, "type": "SPEECH", "speech_asset_id": first_id},
+        {"event_order": 2, "type": "SPEECH", "speech_asset_id": orphan_id},
+    ]
+    production_blocks = [{"content_block_id": "CB06", "block_order": 1, "timeline": timeline}]
+    assert check_narration_fragment_safe(production_blocks, registry.by_id()) == "fail"
+
+
+def test_orphan_fragment_adjacent_to_english_word_is_not_a_false_positive():
+    # "MAP에서 M은" immediately follows a spoken EN_NATIVE "MAP" -- the pre-existing, documented
+    # segmentation limitation (particle glued to an extracted token), not the CB06 deletion bug.
+    registry = SpeechAssetRegistry()
+    en_id = registry.get_or_create("EN_NATIVE", NARRATOR_VOICE, "MAP")
+    ko_id = registry.get_or_create("KO_NARRATION", NARRATOR_VOICE, "에서 M은 /m/ 소리를 냅니다.")
+    timeline = [
+        {"event_order": 1, "type": "SPEECH", "speech_asset_id": en_id},
+        {"event_order": 2, "type": "SPEECH", "speech_asset_id": ko_id},
+    ]
+    production_blocks = [{"content_block_id": "CB05", "block_order": 1, "timeline": timeline}]
+    assert check_narration_fragment_safe(production_blocks, registry.by_id()) == "pass"
+
+
+# ---------------------------------------------------------------------------
+# 11-1: educational_wording_preserved -- "고유한 소리" family must not reappear (CASE T/U)
+# ---------------------------------------------------------------------------
+
+def test_case_t_dangerous_generalization_fails_educational_wording_check():
+    registry = SpeechAssetRegistry()
+    asset_id = registry.get_or_create(
+        "KO_NARRATION", NARRATOR_VOICE, "각 글자가 이 단어에서 내는 고유한 소리를 하나씩 찾아내야 합니다.",
+    )
+    timeline = [{"event_order": 1, "type": "SPEECH", "speech_asset_id": asset_id}]
+    production_blocks = [{"content_block_id": "CB02", "block_order": 1, "timeline": timeline}]
+    assert check_educational_wording_preserved(production_blocks, registry.by_id()) == "fail"
+
+
+def test_case_u_safe_scoped_wording_passes_educational_wording_check():
+    registry = SpeechAssetRegistry()
+    asset_id = registry.get_or_create(
+        "KO_NARRATION", NARRATOR_VOICE, "각 글자가 이 단어에서 나타내는 소리를 순서대로 이어 붙여 읽습니다.",
+    )
+    timeline = [{"event_order": 1, "type": "SPEECH", "speech_asset_id": asset_id}]
+    production_blocks = [{"content_block_id": "CB02", "block_order": 1, "timeline": timeline}]
+    assert check_educational_wording_preserved(production_blocks, registry.by_id()) == "pass"
+
+
+def test_educational_wording_preserved_wired_into_full_integrity_check(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        _seed_bundle(conn)
+    result = build_production_plan(db_path, clip_config=_CLIP_CONFIG, complexity_config=_COMPLEXITY_CONFIG)
+    assert result["integrity_checks"]["educational_wording_preserved"] == "pass"
+
+
+# ---------------------------------------------------------------------------
+# 11-1: STYLE_INTENT vs FACTUAL_CONTENT required_content classification (CASE O-S)
+# ---------------------------------------------------------------------------
+
+def test_case_o_ending_greeting_classified_as_style_intent():
+    assert classify_required_content_type("자연스럽고 부담 없는 마무리 인사") == "STYLE_INTENT"
+
+
+def test_case_r_factual_content_classification_preserved():
+    assert classify_required_content_type("BAG 예시 사용") == "FACTUAL_CONTENT"
+    assert classify_required_content_type("BAG에서 B는 /b/") == "FACTUAL_CONTENT"
+    assert classify_required_content_type("3초 생각 시간 후 CAP 정답 확인") == "FACTUAL_CONTENT"
+
+
+def test_case_p_style_intent_covered_with_real_ending_narration():
+    cb08 = {"content_block_id": "CB08", "learning_function": "RESOLUTION"}
+    registry = SpeechAssetRegistry()
+    asset_id = registry.get_or_create(
+        "KO_NARRATION", NARRATOR_VOICE,
+        "오늘 영상이 도움이 되셨다면 함께 연습을 이어가 보세요. 시청해 주셔서 감사합니다.",
+    )
+    pb = {"content_block_id": "CB08", "block_order": 8, "timeline": [{"event_order": 1, "type": "SPEECH", "speech_asset_id": asset_id}]}
+    covered = is_required_content_covered("자연스럽고 부담 없는 마무리 인사", [], True, pb, registry.by_id())
+    assert covered is True
+
+
+def test_case_q_style_intent_not_auto_passed_without_narration():
+    pb = {"content_block_id": "CB08", "block_order": 8, "timeline": []}
+    covered = is_required_content_covered("자연스럽고 부담 없는 마무리 인사", [], True, pb, {})
+    assert covered is False
+
+
+def test_case_s_factual_content_without_match_still_fails():
+    pb = {"content_block_id": "CB03", "block_order": 1, "timeline": []}
+    covered = is_required_content_covered("BAG 예시 사용", [], False, pb, {})
+    assert covered is False
+
+
+def test_cb08_style_intent_covered_in_full_pipeline(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        _seed_bundle(conn)
+    result = build_production_plan(db_path, clip_config=_CLIP_CONFIG, complexity_config=_COMPLEXITY_CONFIG)
+    cb08 = next(pb for pb in result["production_blocks"] if pb["content_block_id"] == "CB08")
+    assert cb08["required_content_coverage"]["자연스럽고 부담 없는 마무리 인사"] == []  # no lexical overlap
+    assert result["integrity_checks"]["required_content_covered"] == "pass"  # covered via style evidence
+
+
+# ---------------------------------------------------------------------------
+# 11-1: full-pipeline success condition (spec section 40) -- the corrected BAG plan must be
+# ready for asset generation with all 22 Integrity Checks passing.
+# ---------------------------------------------------------------------------
+
+def test_full_bag_plan_reaches_ready_for_asset_generation(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        _seed_bundle(conn)
+    result = build_production_plan(db_path, clip_config=_CLIP_CONFIG, complexity_config=_COMPLEXITY_CONFIG)
+    checks = result["integrity_checks"]
+    assert len(checks) >= 22
+    for name, status in checks.items():
+        assert status == "pass", f"{name} unexpectedly failed"
+    assert result["ready_for_asset_generation"] is True
+    assert not any(
+        is_punctuation_only_fragment(a["source_text"]) for a in result["speech_assets"] if a["speech_mode"] != "EN_PHONEME_DEMO"
+    )
+    en_native = {a["source_text"] for a in result["speech_assets"] if a["speech_mode"] == "EN_NATIVE"}
+    assert {"BAG", "BAT", "MAP", "CAP"}.issubset(en_native)

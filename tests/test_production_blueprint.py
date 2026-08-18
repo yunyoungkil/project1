@@ -9,6 +9,8 @@ from research.production_blueprint import (
     build_blueprint,
     build_production_blueprint_report,
     check_example_scope_safe,
+    check_mini_success_target_novel_safe,
+    check_mini_success_uses_learned_material_safe,
     check_phoneme_explanation_safe,
     check_promise_matches_scope,
     compute_blueprint_score,
@@ -649,3 +651,80 @@ def test_example_ladder_words_pass_through_sanitize_unchanged():
     blueprint = generate_blueprint_content(package, _FakeGemini(response), {})
     words = [e["word"] for e in blueprint["example_ladder"]]
     assert words == ["BAG", "BAT", "MAP", "CAP"]
+
+
+# ---------------------------------------------------------------------------
+# 09-5: Mini Success target lineage backstops (spec sections 28-29)
+# ---------------------------------------------------------------------------
+
+def _bag_ladder():
+    return [
+        {"level": 1, "word": "CAT", "target_pattern": "C /k/ + A /æ/ + T /t/", "purpose": "p", "difficulty": "easy", "exception_risk": "low"},
+        {"level": 2, "word": "BAT", "target_pattern": "B /b/ + A /æ/ + T /t/", "purpose": "p", "difficulty": "easy", "exception_risk": "low"},
+        {"level": 3, "word": "BAG", "target_pattern": "B /b/ + A /æ/ + G /g/", "purpose": "p", "difficulty": "medium", "exception_risk": "low"},
+        {"level": 4, "word": "MAP", "target_pattern": "M /m/ + A /æ/ + P /p/", "purpose": "p", "difficulty": "medium", "exception_risk": "low"},
+    ]
+
+
+# CASE A: 08 Practice=MAP, 08 MiniSuccess=CAP -- independent target preserved.
+def test_case_a_independent_new_target_passes_novelty_and_material_checks():
+    blueprint = {"example_ladder": _bag_ladder(), "mini_success": {"description": "CAP을 스스로 읽어본다", "prompt_word": "CAP", "think_seconds": 3}}
+    assert check_mini_success_target_novel_safe(blueprint) == "pass"
+    assert check_mini_success_uses_learned_material_safe(blueprint) == "pass"
+
+
+# CASE C: 08 itself already has Practice=MAP, MiniSuccess=MAP -- upstream design issue detected.
+def test_case_c_reusing_the_fully_scaffolded_practice_word_fails_novelty():
+    blueprint = {"example_ladder": _bag_ladder(), "mini_success": {"description": "MAP을 스스로 읽어본다", "prompt_word": "MAP", "think_seconds": 3}}
+    assert check_mini_success_target_novel_safe(blueprint) == "fail"
+
+
+def test_legacy_equation_style_prompt_word_still_caught_by_novelty_check():
+    # The exact real-data shape found in production_blueprints -- prompt_word bakes the answer
+    # phonemes in and still names the practiced word, even with no clean [A-Z]{2,} token to extract.
+    blueprint = {
+        "example_ladder": _bag_ladder(),
+        "mini_success": {"description": "MAP 단어를 3초 안에 스스로 소리 내어 읽어보는 퀴즈", "prompt_word": "M /m/ + A /æ/ + P /p/ = ?", "think_seconds": 3},
+    }
+    assert check_mini_success_target_novel_safe(blueprint) == "fail"
+
+
+# CASE D: CAP's required phonemes (C/A/P) are all a subset of the learned inventory -- pass.
+def test_case_d_novel_target_using_only_learned_phonemes_passes():
+    blueprint = {"example_ladder": _bag_ladder(), "mini_success": {"prompt_word": "CAP"}}
+    assert check_mini_success_uses_learned_material_safe(blueprint) == "pass"
+
+
+# CASE E: a target requiring an unlearned letter/sound fails.
+def test_case_e_target_requiring_unlearned_letter_fails():
+    blueprint = {"example_ladder": _bag_ladder(), "mini_success": {"prompt_word": "DOG"}}
+    assert check_mini_success_uses_learned_material_safe(blueprint) == "fail"
+
+
+def test_mini_success_lineage_checks_wired_into_full_integrity_check():
+    package = {"title": "t", "example_word": "MAP"}
+    blueprint = _valid_response(
+        example_ladder=_bag_ladder(),
+        mini_success={"description": "CAP을 스스로 읽어본다", "prompt_word": "CAP", "think_seconds": 3},
+    )
+    checks = run_integrity_check(package, blueprint)
+    assert checks["mini_success_target_novel_safe"] == "pass"
+    assert checks["mini_success_uses_learned_material_safe"] == "pass"
+
+
+def test_mini_success_reused_target_fails_full_integrity_gate():
+    package = {"title": "t", "example_word": "MAP"}
+    blueprint = _valid_response(
+        example_ladder=_bag_ladder(),
+        mini_success={"description": "MAP을 스스로 읽어본다", "prompt_word": "MAP", "think_seconds": 3},
+    )
+    checks = run_integrity_check(package, blueprint)
+    assert checks["mini_success_target_novel_safe"] == "fail"
+    assert ready_for_script(checks) is False
+
+
+# 09-5 section 19: "고유한 소리" scoped-exception regression, found in live Gemini output --
+# "이 단어 안에서 내는 고유한 소리" must fail regardless of the "이 단어" scoping phrase nearby.
+def test_generic_letter_sound_claim_fails_even_when_softly_scoped():
+    text = "각 글자가 이 단어 안에서 내는 고유한 소리를 순서대로 이어 붙이는 것입니다."
+    assert check_example_scope_safe({"core_answer": text}) == "fail"

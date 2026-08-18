@@ -41,6 +41,7 @@ _JARGON_TERMS = ("onset", "nucleus", "coda", "phonemic blending", "음소론", "
 _VISUAL_DEPENDENT_PHRASES = ("이것", "여기", "보시는 것처럼", "보시면", "이렇게 보시면")
 _PAUSE_CUE_RE = re.compile(r"\[PAUSE\s*(\d+)\s*SEC\]|생각\s*시간|(\d+)\s*초")
 _RECAP_SIGNAL_KEYWORDS = ("정리", "복습", "요약", "recap")
+_IPA_TOKEN_RE = re.compile(r"/[^/\s]+/")
 _MEMORIZATION_NEAR_IPA_RE = re.compile(r"(외우|암기)[^./!?\n]{0,20}/[^/]+/|/[^/]+/[^./!?\n]{0,20}(외우|암기)")
 
 # 09-1: narration-level (not just Video Promise-level) scope-overreach phrases -- these already
@@ -222,6 +223,10 @@ Natural Next Topics: {natural_next_topics}
   냅니다", "BAG와 BAT에서는 B가 /b/ 소리를 냅니다"). "C는 /k/ 소리입니다", "B는 단어 안에서 /b/
   소리를 냅니다"처럼 특정 예시 단어를 명시하지 않고 모든 단어에 적용되는 일반 규칙처럼 말하지 마라
   ("단어 안에서"는 범위 한정이 아니다 -- 반드시 실제 예시 단어 이름이나 "이 단어"/"오늘 예시"를 붙여라).
+- core_answer를 포함해 어디에서도 "각 글자가 내는 고유한 소리", "알파벳마다 정해진 소리가 있다"
+  처럼 글자마다 하나의 고정된 소리가 있다고 암시하는 표현을 쓰지 마라 -- "이 단어에서" 같은 범위
+  한정을 붙여도 "고유한"/"정해진"이라는 단어 선택 자체가 위험하다. 대신 "이 단어에서 나타내는
+  소리", "오늘 다루는 단어에서 글자가 나타내는 소리"처럼 지금 다루는 예시로 범위를 한정하라.
 - IPA는 정확성 도구일 뿐 시청자의 암기 과제가 아니다. "/æ/를 외우세요" 같은 표현을 쓰지 마라.
   필요하면 "이 기호를 외울 필요는 없습니다, 지금 나는 소리에만 집중하세요" 정도로 안내하라.
 
@@ -255,11 +260,19 @@ Audio-first 원칙:
 - 화면을 보지 않아도 핵심 흐름을 이해할 수 있어야 한다. "여기 보시면 이렇게 됩니다" 같은 시각
   의존 표현을 과도하게 쓰지 마라.
 
-Mini Success 원칙:
+Mini Success 원칙 (중요):
 - CAP 등 Mini Success 단어의 정답을 즉시 말하지 않는다. `viewer_action`에 "정답 공개 전에 CAP을
   직접 읽어본다"처럼 시청자 행동을 적고, `thinking_time_seconds`에 생각 시간(초)을 숫자로 적어라.
   이 시간을 화면에서 "어떻게" 표현할지(정지 화면, 카운트다운 애니메이션 등)는 정하지 마라 -- 그건
   10단계의 몫이다. narration에는 "[PAUSE 3 SEC]"처럼 짧게 시간 경과를 알리는 표시 정도만 남긴다.
+- mini_success_beats에서 "[PAUSE N SEC]" cue 이전 narration에는 음소 표기(/k/, /æ/, /p/ 같은
+  IPA)나 전체 발음을 절대 넣지 마라. 시청자가 아직 시도하지 않은 상태에서 정답 소리를 먼저 들려주면
+  더 이상 스스로 소리를 떠올리는 것이 아니라 주어진 답을 따라 읽는 것이 된다. pause 이전에는 대상
+  단어의 철자(예: "CAP")와 "직접 읽어보세요" 같은 행동 유도만 적고, IPA 음소 breakdown과 자연스러운
+  발음 확인은 반드시 "[PAUSE N SEC]" 다음 narration에서만 등장해야 한다.
+  BAD (pause 전): "오늘 배운 C의 /k/, A의 /æ/, P의 /p/ 소리를 합쳐 CAP을 읽어보세요."
+  GOOD (pause 전): "화면의 단어를 보고, 오늘 배운 방법대로 직접 소리 내어 읽어보세요."
+  GOOD (pause 후): "C의 /k/, A의 /æ/, P의 /p/ 소리를 이어 CAP이 됩니다."
 
 Retention 원칙 (중요, retention_intent로 구조화):
 - 각 Content Block에 `retention_intent: {{"type": "...", "purpose": "..."}}`를 채워라. type은
@@ -775,6 +788,198 @@ def check_format_neutrality_safe(content_blocks: list[dict]) -> str:
     return "fail" if any(p in text for p in _FORMAT_LEAKAGE_PATTERNS) else "pass"
 
 
+# ---------------------------------------------------------------------------
+# 09-4: mini_success_present structural re-judgment (spec sections 2-7). The old check required
+# blueprint.mini_success.prompt_word (e.g. "M /m/ + A /æ/ + P /p/ = ?") to appear as a literal
+# substring in the narration -- Gemini almost never echoes that exact equation text back verbatim,
+# so a real, structurally complete Mini Success (viewer_action + pause + IPA answer, all present
+# and correctly ordered) still failed. This replaces the substring match with the structural
+# signals from spec section 3: a real Mini Success block, an explicit attempt cue, answer evidence
+# (IPA is the concrete "the answer was actually given" signal -- a bare target word alone is not,
+# since showing the word to read is the legitimate prompt), and attempt-before-answer ordering.
+# ---------------------------------------------------------------------------
+
+def _is_mini_success_block(cb: dict) -> bool:
+    learning_function = cb.get("learning_function")
+    if learning_function == "MINI_SUCCESS":
+        return True
+    if learning_function and learning_function != "OTHER":
+        # An explicit, different learning_function taxonomy value takes precedence over a
+        # retention_intent label that only describes *why* the block exists -- e.g. a PRACTICE
+        # block whose retention purpose is "priming for the upcoming mini success" can legitimately
+        # carry retention_intent.type == "mini_success" without itself being the Mini Success.
+        return False
+    return (cb.get("retention_intent") or {}).get("type") == "mini_success"
+
+
+def _has_answer_evidence(text: str, blueprint: dict) -> bool:
+    """IPA is the concrete "the sound answer was actually given" signal. A bare target word
+    (e.g. "MAP") is not counted here on its own -- that's the legitimate pre-pause prompt ("read
+    MAP"), not evidence that an answer/confirmation exists; only the Blueprint's own prompt_word
+    (spec section 5's "expected_word") counts as an explicit non-IPA answer signal."""
+    if _IPA_TOKEN_RE.search(text):
+        return True
+    prompt_word = (blueprint.get("mini_success") or {}).get("prompt_word") or ""
+    return bool(prompt_word) and prompt_word.lower() in text.lower()
+
+
+def _answer_revealed_before_attempt(beats: list[dict]) -> bool:
+    """IPA is the concrete "sound answer" signal -- the bare target word (e.g. "MAP을 직접
+    읽어보세요.") is the legitimate pre-pause prompt, not a reveal, so only IPA tokens count here."""
+    pause_index = next(
+        (i for i, b in enumerate(beats) if b.get("type") == "cue" and _PAUSE_CUE_RE.search(str(b.get("text") or ""))), None,
+    )
+    if pause_index is not None:
+        pre_text = " ".join(str(b.get("text") or "") for b in beats[:pause_index] if b.get("type") == "narration")
+        return bool(_IPA_TOKEN_RE.search(pre_text))
+    narration_beats = [b for b in beats if b.get("type") == "narration"]
+    if not narration_beats:
+        return False
+    return bool(_IPA_TOKEN_RE.search(str(narration_beats[0].get("text") or "")))
+
+
+def _mini_success_candidates(script: dict, content_blocks: list[dict]) -> list[dict]:
+    """Signal #1's third alternative (spec section 3): the dedicated mini_success_meta/beats
+    structure counts as Mini Success evidence on its own, even when a content block wasn't (or
+    couldn't be) tagged learning_function == MINI_SUCCESS -- e.g. a bare script dict built without
+    going through _sanitize_block_meta's fallback tagging."""
+    raw_beats = script.get("mini_success_beats") or []
+    candidates = [cb for cb in content_blocks if _is_mini_success_block(cb)]
+    if raw_beats:
+        mini_meta = script.get("mini_success_meta") or {}
+        candidates.append({"base_narration": _block_narration(raw_beats), "viewer_action": mini_meta.get("viewer_action")})
+    return candidates
+
+
+def _candidate_beats(cb: dict, raw_beats: list[dict]) -> list[dict]:
+    """Prefer the raw mini_success_beats (retains the [PAUSE N SEC] cue for order-checking) when
+    they're the actual source of this block's narration; otherwise fall back to a synthetic single
+    narration beat built from the block's own text, which still preserves before/after ordering
+    even without the cue itself."""
+    narration = cb.get("base_narration") or ""
+    if raw_beats and _block_narration(raw_beats) == narration:
+        return raw_beats
+    return [{"type": "narration", "text": narration}]
+
+
+def check_mini_success_present(blueprint: dict, script: dict, content_blocks: list[dict]) -> str:
+    candidates = _mini_success_candidates(script, content_blocks)
+    if not candidates:
+        return "fail"
+
+    raw_beats = script.get("mini_success_beats") or []
+    for cb in candidates:
+        narration = cb.get("base_narration") or ""
+        has_action_signal = bool(cb.get("viewer_action")) or any(p in narration for p in _PARTICIPATORY_PHRASES)
+        if not has_action_signal:
+            continue
+
+        beats = _candidate_beats(cb, raw_beats)
+        beat_text = " ".join(str(b.get("text") or "") for b in beats if b.get("type") == "narration")
+
+        if not _has_answer_evidence(beat_text, blueprint):
+            continue
+        if _answer_revealed_before_attempt(beats):
+            continue
+        return "pass"
+    return "fail"
+
+
+# ---------------------------------------------------------------------------
+# 09-5 section 9-12: mini_success_answer_barrier_safe. Distinct from mini_success_present's
+# structural check -- this specifically re-verifies, for every recognized Mini Success candidate,
+# that no answer-pronunciation evidence (IPA phonemes/full pronunciation) precedes the attempt.
+# TARGET ORTHOGRAPHY (the bare word shown as the prompt) is not answer information and is allowed
+# freely before the pause; only IPA counts as a reveal (see _answer_revealed_before_attempt).
+#
+# Known limitation: at 09's plain-text stage there is no structural way to distinguish "CAP shown
+# as the prompt spelling" from "CAP spoken aloud as the natural-pronunciation answer" (spec
+# section 11's third reveal example) -- both are just the substring "CAP" in narration text. That
+# distinction only becomes checkable once speech_mode exists (11's answer_not_revealed_before_
+# attempt, which classifies EN_NATIVE/EN_PHONEME_DEMO speech events against the timeline).
+# ---------------------------------------------------------------------------
+
+def check_mini_success_answer_barrier_safe(script: dict, content_blocks: list[dict]) -> str:
+    candidates = _mini_success_candidates(script, content_blocks)
+    if not candidates:
+        return "warning"  # mini_success_present already owns "no Mini Success at all"
+
+    raw_beats = script.get("mini_success_beats") or []
+    for cb in candidates:
+        beats = _candidate_beats(cb, raw_beats)
+        if _answer_revealed_before_attempt(beats):
+            return "fail"
+    return "pass"
+
+
+# ---------------------------------------------------------------------------
+# 09-4: practice_mini_success_progression_safe (spec sections 8-12). Reusing the same target word
+# in a PRACTICE block and a MINI_SUCCESS block is a legitimate GUIDED PRACTICE -> INDEPENDENT
+# ATTEMPT progression, not automatic duplication -- it only becomes real repetition when scaffold
+# does NOT decrease (Practice already required an independent attempt too) or the two blocks share
+# the same viewer_action AND thinking_time (spec section 10's FAIL example).
+# ---------------------------------------------------------------------------
+
+def check_practice_mini_success_progression_safe(content_blocks: list[dict]) -> str:
+    practice_blocks = [cb for cb in content_blocks if cb.get("learning_function") == "PRACTICE"]
+    mini_blocks = [cb for cb in content_blocks if _is_mini_success_block(cb)]
+
+    for practice in practice_blocks:
+        practice_words = set(_UPPERCASE_TOKEN_RE.findall(str(practice.get("base_narration") or "")))
+        for mini in mini_blocks:
+            mini_words = set(_UPPERCASE_TOKEN_RE.findall(str(mini.get("base_narration") or "")))
+            if not (practice_words & mini_words):
+                continue  # different target example -- not the same activity at all
+
+            practice_has_scaffold = bool(_IPA_TOKEN_RE.search(str(practice.get("base_narration") or ""))) and not practice.get("viewer_action")
+            mini_is_independent = bool(mini.get("viewer_action"))
+
+            same_viewer_action = bool(
+                practice.get("viewer_action") and mini.get("viewer_action")
+                and _content_words(practice["viewer_action"]) == _content_words(mini["viewer_action"])
+            )
+            same_thinking_time = bool(
+                practice.get("thinking_time_seconds") and mini.get("thinking_time_seconds")
+                and practice["thinking_time_seconds"] == mini["thinking_time_seconds"]
+            )
+
+            if practice_has_scaffold and mini_is_independent and not (same_viewer_action and same_thinking_time):
+                continue  # legitimate GUIDED PRACTICE -> INDEPENDENT MINI SUCCESS progression
+            return "fail"
+    return "pass"
+
+
+# ---------------------------------------------------------------------------
+# 09-4: ending_resolves_opening closing-region widening (spec sections 13-17). The old check only
+# looked at the single `ending` Block's narration -- a short final sign-off (next-topic preview +
+# thanks) that never re-mentions the Core Question. The actual resolution (a RECAP restating the
+# core principle) can sit in an earlier Block that's still part of the closing region.
+# ---------------------------------------------------------------------------
+
+_CLOSING_REGION_FUNCTIONS = {"RECAP", "RESOLUTION", "MINI_SUCCESS"}
+
+
+def collect_closing_region(content_blocks: list[dict]) -> list[dict]:
+    closing: list[dict] = []
+    for cb in reversed(content_blocks):
+        if cb.get("learning_function") in _CLOSING_REGION_FUNCTIONS:
+            closing.append(cb)
+        else:
+            break
+    closing.reverse()
+    return closing or (content_blocks[-1:] if content_blocks else [])
+
+
+def check_ending_resolves_opening(blueprint: dict, content_blocks: list[dict]) -> str:
+    closing_blocks = collect_closing_region(content_blocks)
+    closing_text = " ".join(cb.get("base_narration") or "" for cb in closing_blocks)
+    core_question_words = _content_words(blueprint.get("core_question", ""))
+    recap_signal = any(kw in closing_text for kw in _RECAP_SIGNAL_KEYWORDS) or bool(
+        core_question_words & _content_words(closing_text)
+    )
+    return "pass" if recap_signal else "warning"
+
+
 def check_content_block_uniqueness_safe(content_blocks: list[dict]) -> str:
     """09-3: independent re-verification that no two direction-eligible blocks represent the same
     educational event -- doesn't rely on build_content_blocks having already deduplicated (a block
@@ -856,11 +1061,8 @@ def run_script_integrity_check(
             break
     checks["no_scope_creep"] = "fail" if scope_creep else "pass"
 
-    mini_text = " ".join(str(b.get("text") or "") for b in script.get("mini_success_beats") or [])
-    mini_word = (blueprint.get("mini_success") or {}).get("prompt_word") or ""
-    has_word = bool(mini_word) and mini_word.lower() in mini_text.lower()
-    has_pause = bool(_PAUSE_CUE_RE.search(mini_text))
-    checks["mini_success_present"] = "pass" if has_word and has_pause else "fail"
+    checks["mini_success_present"] = check_mini_success_present(blueprint, script, content_blocks)
+    checks["mini_success_answer_barrier_safe"] = check_mini_success_answer_barrier_safe(script, content_blocks)
 
     all_narration = " ".join(_narration_texts(script))
     sentences = [s for s in re.split(r"[.!?\n]", all_narration) if s.strip()]
@@ -887,12 +1089,7 @@ def run_script_integrity_check(
         ipa_status = "fail"
     checks["ipa_not_taught_as_memorization"] = ipa_status
 
-    ending_text = " ".join(str(b.get("text") or "") for b in (script.get("ending") or {}).get("beats") or [])
-    core_question_words = _content_words(blueprint.get("core_question", ""))
-    recap_signal = any(kw in ending_text for kw in _RECAP_SIGNAL_KEYWORDS) or bool(
-        core_question_words & _content_words(ending_text)
-    )
-    checks["ending_resolves_opening"] = "pass" if recap_signal else "warning"
+    checks["ending_resolves_opening"] = check_ending_resolves_opening(blueprint, content_blocks)
 
     # 09-2: format_neutrality_safe -- 09 must not smuggle in production/format decisions.
     checks["format_neutrality_safe"] = check_format_neutrality_safe(content_blocks)
@@ -900,6 +1097,11 @@ def run_script_integrity_check(
     # 09-3: content_block_uniqueness_safe -- a critical check, so a duplicate slipping through
     # (however it got there) blocks ready_for_direction just like any other fail.
     checks["content_block_uniqueness_safe"] = check_content_block_uniqueness_safe(content_blocks)
+
+    # 09-4: practice_mini_success_progression_safe -- same target word in PRACTICE and
+    # MINI_SUCCESS is a legitimate GUIDED -> INDEPENDENT progression, not automatic duplication;
+    # this only fails when scaffold doesn't actually decrease (spec sections 8-12).
+    checks["practice_mini_success_progression_safe"] = check_practice_mini_success_progression_safe(content_blocks)
 
     return checks
 
@@ -1096,6 +1298,57 @@ def build_script(
         "integrity_checks": checks,
         "ready_for_production": ready,
         "ready_for_direction": ready_for_direction,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 09-4 section 25-26: re-evaluates an already-persisted video_scripts row against the current
+# validation logic -- read-only, no Gemini call, no DB write -- so a Gate-logic fix can be verified
+# against real, previously-generated content without risking a fresh Gemini call rewording the
+# narration (which would defeat verifying that the fix judges *this* content correctly).
+# ---------------------------------------------------------------------------
+
+def recheck_script_integrity(db_path: Path, script_row: dict) -> dict:
+    with connect(db_path) as conn:
+        blueprint_row = conn.execute(
+            "SELECT * FROM production_blueprints WHERE id = ?", (script_row["blueprint_id"],)
+        ).fetchone()
+    blueprint = _load_blueprint(dict(blueprint_row))
+    blueprint["title"] = script_row["title"]
+    blueprint["thumbnail_text"] = script_row["thumbnail_text"]
+
+    script = json.loads(script_row["script_json"])
+    script_text = script_row["script_text"]
+    content_blocks = json.loads(script_row["content_blocks_json"])
+
+    checks = run_script_integrity_check(blueprint, script_row["title"], script_row["thumbnail_text"], script, script_text, content_blocks)
+
+    hook_score = compute_hook_score(blueprint, script)
+    clarity_score = compute_clarity_score(script)
+    scope_alignment_score = compute_scope_alignment_score(blueprint, checks)
+    example_alignment_score = compute_example_alignment_score(blueprint, checks)
+    audio_first_score = compute_audio_first_score(checks)
+    retention_score = compute_retention_score(script)
+    script_score = compute_script_score({
+        "hook": hook_score, "clarity": clarity_score, "scope_alignment": scope_alignment_score,
+        "example_alignment": example_alignment_score, "audio_first": audio_first_score, "retention": retention_score,
+    })
+
+    ready = ready_for_production_gate(checks, script_score)
+    if script_row.get("generation_method") == "fallback":
+        ready = False
+
+    return {
+        "integrity_checks": checks,
+        "hook_score": hook_score,
+        "clarity_score": clarity_score,
+        "scope_alignment_score": scope_alignment_score,
+        "example_alignment_score": example_alignment_score,
+        "audio_first_score": audio_first_score,
+        "retention_score": retention_score,
+        "script_score": script_score,
+        "ready_for_production": ready,
+        "ready_for_direction": ready,
     }
 
 

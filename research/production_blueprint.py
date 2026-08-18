@@ -111,6 +111,18 @@ Promise 범위 원칙 (중요):
 - viewer_contract의 video_promise/expected_transformation은 learning_objectives와 scope_in이
   다루는 범위를 넘어서는 약속을 하지 마라. 예를 들어 scope가 "단모음 A"로 한정되어 있으면 "모든
   단모음", "어떤 단어든", "완벽하게", "무조건" 같은 과잉 일반화 표현을 쓰지 마라.
+
+Mini Success 설계 원칙 (중요):
+- mini_success.prompt_word는 시청자가 스스로 읽어볼 "새로운" 단어 철자 하나만 적어라 (예: "CAP").
+  example_ladder에서 이미 완전히 풀이한 단어, 특히 가장 마지막(가장 높은 level) 단어를 그대로
+  재사용하지 마라 -- Mini Success는 복습이 아니라 배운 원리를 새 단어에 스스로 적용해보는 독립
+  시도이며, 이미 정답까지 다 보여준 단어를 다시 내면 scaffold가 충분히 줄어들지 않는다.
+- prompt_word에 음소 표기나 정답 발음을 넣지 마라 ("M /m/ + A /æ/ + P /p/ = ?" 같은 형태 금지).
+  prompt_word는 오직 화면에 보여줄 단어 철자여야 하고, 정답 소리는 다음 단계에서 학습자가 직접
+  시도한 이후에만 공개되어야 한다.
+- mini_success 대상 단어는 지금까지 example_ladder에서 이미 다룬 글자 소리만으로 풀 수 있어야
+  한다 (새 자음/모음 조합이나 새 규칙을 요구하지 마라). scope_in 범위 안이어야 하고, 발음 예외가
+  없는 단어여야 한다.
 {continuity_note}
 hook_type은 반드시 다음 중에서: {hook_types}
 retention_device는 반드시 다음 중에서 (section마다 최대 1개, 억지로 만들지 말 것): {retention_devices}
@@ -362,7 +374,13 @@ _LETTER_SOUND_IPA_CLAIM_RE = re.compile(r"\b[A-Za-z]\s*(?:는|은|가|이)\b[^./
 # A claim only counts as properly scoped if "에서" is anchored to an actual example word (or an
 # explicit "이 단어"/"오늘 예시"/"오늘 배운" phrase) right before it -- not just any "에서" anywhere
 # in the sentence. This is what "단어 안에서" (a generic, unscoped "에서") used to slip past.
-_SCOPE_PREFIX = r"(?:[A-Z]{2,}(?:\s*[와과]\s*[A-Z]{2,})?|이\s*단어(?:\s*[A-Z]{2,})?|오늘\s*예시|오늘\s*배운|이\s*예시)"
+# 09-5: "MAP이라는 단어에서" (real Gemini output) is just as properly scoped as "이 단어에서", but
+# the "이라는 단어" filler between the word and "에서" wasn't accounted for and fell through as a
+# false positive -- added as an explicit optional component rather than a separate alternative.
+_SCOPE_PREFIX = (
+    r"(?:[A-Z]{2,}(?:\s*[와과]\s*[A-Z]{2,})?(?:\s*(?:이라는|라는)\s*단어)?"
+    r"|이\s*단어(?:\s*[A-Z]{2,})?|오늘\s*예시|오늘\s*배운|이\s*예시)"
+)
 # 09-3: "의" (possessive: "BAT의 끝소리는 /t/") is just as valid a scoping anchor as "에서" (in/at)
 # -- both explicitly tie the claim to one named word rather than stating it as a bare rule. "은/는/
 # 이/가/이다" are deliberately excluded: "CAP이다" only asserts an equality/conclusion, it doesn't
@@ -372,12 +390,12 @@ _SCOPED_CONTEXT_RE = re.compile(_SCOPE_PREFIX + r"\s*(?:에서|의)")
 # 09-3: a softer variant of the same "letter = fixed sound" generalization, without naming any
 # specific letter or IPA at all -- "각 글자가 내는 고유한 소리", "알파벳마다 정해진 소리가 있다".
 # This implies every letter has one permanent sound, which the channel's Scope (a handful of CVC
-# examples) never claims. Scoping here is looser than _SCOPED_CONTEXT_RE (spec's own GOOD example
-# "오늘 다루는 단어에서" doesn't match the strict word+에서 anchor), so any explicit "this
-# word/today/here/now" cue or a named example word is accepted.
-_GENERIC_LETTER_SOUND_RE = re.compile(r"(글자|알파벳)[^.!?\n]{0,10}(고유한|정해진)\s*소리")
-_SOFT_SCOPE_SIGNALS = ("이 단어", "오늘", "지금", "여기서")
-_EXAMPLE_WORD_TOKEN_RE = re.compile(r"[A-Z]{2,}")
+# examples) never claims. 09-5: unlike _SCOPED_CONTEXT_RE-gated claims above, this specific
+# phrasing is banned unconditionally regardless of nearby scoping words (see _scope_safe_over_texts).
+# Gap widened from an original 10 to 20 chars (matching _LETTER_SOUND_IPA_CLAIM_RE's gap
+# elsewhere in this file) -- real Gemini output ("글자가 이 단어 안에서 내는 고유한") put 14 chars
+# between the two anchors, which the narrower gap let slip through undetected.
+_GENERIC_LETTER_SOUND_RE = re.compile(r"(글자|알파벳)[^.!?\n]{0,20}(고유한|정해진)\s*소리")
 
 _OVERGENERALIZATION_KEYWORDS = ("모든", "항상", "어떤 단어든", "완벽하게", "무조건", "전부")
 
@@ -440,10 +458,14 @@ def _scope_safe_over_texts(texts: list[str]) -> str:
             triggered = _LETTER_SOUND_CLAIM_RE.search(sentence) or _LETTER_SOUND_IPA_CLAIM_RE.search(sentence)
             if triggered and not _SCOPED_CONTEXT_RE.search(text):
                 return "fail"
+            # 09-5: "고유한/정해진 소리" (letter = one fixed/inherent sound) is a word-choice problem,
+            # not a scope problem -- "이 단어에서 내는 고유한 소리" still implies permanence even
+            # scoped to one word. The soft-scope signals below used to exempt exactly this phrasing
+            # (a real regression traced from live Gemini output: "각 글자가 이 단어 안에서 내는
+            # 고유한 소리"), so this pattern is banned unconditionally; only a different word choice
+            # ("나타내는 소리" etc.) is safe, not additional scoping.
             if _GENERIC_LETTER_SOUND_RE.search(sentence):
-                scoped = any(sig in text for sig in _SOFT_SCOPE_SIGNALS) or bool(_EXAMPLE_WORD_TOKEN_RE.search(text))
-                if not scoped:
-                    return "fail"
+                return "fail"
     return status
 
 
@@ -458,6 +480,81 @@ def check_phoneme_explanation_safe(blueprint: dict) -> str:
 
 def check_example_scope_safe(blueprint: dict) -> str:
     return _scope_safe_over_texts(_blueprint_text_items(blueprint))
+
+
+# ---------------------------------------------------------------------------
+# 09-5: Mini Success target lineage backstops. The actual regression traced back to *this* stage
+# -- mini_success.prompt_word was generated as the same word as example_ladder's last (most
+# scaffolded) level, sometimes with the answer phonemes baked directly into the field
+# ("M /m/ + A /æ/ + P /p/ = ?"). These are independent, deterministic re-checks of that lineage,
+# not a rewrite of the prompt's output -- they only ever gate ready_for_script.
+# ---------------------------------------------------------------------------
+
+_BARE_TARGET_WORD_RE = re.compile(r"^[A-Z]{2,}$")
+_UPPERCASE_WORD_RE = re.compile(r"[A-Z]{2,}")
+_LETTER_PHONEME_PAIR_RE = re.compile(r"([A-Z])\s*/([^/\s]+)/")
+
+
+def _mini_success_target_word(mini_success: dict) -> str:
+    prompt_word = str(mini_success.get("prompt_word") or "").strip()
+    if _BARE_TARGET_WORD_RE.match(prompt_word):
+        return prompt_word
+    # Legacy/ambiguous field content (e.g. an old equation-style "M /m/ + ... = ?" prompt_word,
+    # which has no >=2-letter uppercase token at all) -- nothing clean to extract.
+    match = _UPPERCASE_WORD_RE.search(prompt_word)
+    return match.group(0) if match else ""
+
+
+def _learned_letter_sounds(example_ladder: list[dict]) -> dict[str, set]:
+    """Maps each letter to the IPA sound(s) it was shown producing, derived purely from the
+    Blueprint's own example_ladder target_pattern text (e.g. "M /m/ + A /æ/ + P /p/") -- reuses
+    data the Blueprint already generated instead of a new phonics dictionary (spec section 17)."""
+    mapping: dict[str, set] = {}
+    for e in example_ladder or []:
+        for letter, phoneme in _LETTER_PHONEME_PAIR_RE.findall(str(e.get("target_pattern") or "")):
+            mapping.setdefault(letter, set()).add(phoneme)
+    return mapping
+
+
+def check_mini_success_target_novel_safe(blueprint: dict) -> str:
+    """Mini Success target must not be the same word as the most-scaffolded (highest-level)
+    Example Ladder entry -- that word already had its answer fully revealed during guided
+    practice, so reusing it doesn't give scaffold-reduced independent transfer (spec section 8)."""
+    ladder = blueprint.get("example_ladder") or []
+    if not ladder:
+        return "warning"
+    practice_level = max(ladder, key=lambda e: e.get("level") or 0)
+    practice_word = str(practice_level.get("word") or "").strip().upper()
+    if not practice_word:
+        return "warning"
+
+    mini_success = blueprint.get("mini_success") or {}
+    target_word = _mini_success_target_word(mini_success)
+    if target_word:
+        return "fail" if target_word.upper() == practice_word else "pass"
+
+    # No clean bare target word -- fall back to a blob-level mention check so an old-format
+    # equation that still names the practiced word is still caught.
+    mini_text = f"{mini_success.get('prompt_word') or ''} {mini_success.get('description') or ''}".upper()
+    if not mini_text.strip():
+        return "warning"
+    return "fail" if re.search(rf"\b{re.escape(practice_word)}\b", mini_text) else "pass"
+
+
+def check_mini_success_uses_learned_material_safe(blueprint: dict) -> str:
+    """Every letter in the Mini Success target must already have a demonstrated sound somewhere
+    in the Example Ladder -- it must not require a new consonant/vowel combination or rule."""
+    mini_success = blueprint.get("mini_success") or {}
+    target_word = _mini_success_target_word(mini_success)
+    if not target_word:
+        return "warning"  # nothing clean to verify against (legacy/ambiguous field content)
+
+    learned = _learned_letter_sounds(blueprint.get("example_ladder") or [])
+    if not learned:
+        return "warning"
+
+    missing_letters = [ch for ch in target_word if ch not in learned]
+    return "fail" if missing_letters else "pass"
 
 
 def check_promise_matches_scope(blueprint: dict) -> str:
@@ -523,6 +620,11 @@ def run_integrity_check(package: dict, blueprint: dict) -> dict:
     checks["phoneme_explanation_safe"] = check_phoneme_explanation_safe(blueprint)
     checks["example_scope_safe"] = check_example_scope_safe(blueprint)
     checks["promise_matches_scope"] = check_promise_matches_scope(blueprint)
+
+    # 09-5: Mini Success target lineage backstops -- the target must not reuse the already-fully-
+    # scaffolded Practice word, and must only require already-taught letter sounds.
+    checks["mini_success_target_novel_safe"] = check_mini_success_target_novel_safe(blueprint)
+    checks["mini_success_uses_learned_material_safe"] = check_mini_success_uses_learned_material_safe(blueprint)
 
     return checks
 

@@ -8,7 +8,12 @@ from research.script_writer import (
     build_script,
     build_script_report,
     check_content_block_uniqueness_safe,
+    check_ending_resolves_opening,
     check_format_neutrality_safe,
+    check_mini_success_answer_barrier_safe,
+    check_mini_success_present,
+    check_practice_mini_success_progression_safe,
+    collect_closing_region,
     compute_audio_first_score,
     compute_hook_score,
     compute_retention_score,
@@ -17,6 +22,7 @@ from research.script_writer import (
     estimate_duration_and_words,
     generate_script_content,
     ready_for_production_gate,
+    recheck_script_integrity,
     run_script_integrity_check,
     select_target_blueprint,
 )
@@ -149,6 +155,7 @@ def _good_script_response():
         "mini_success_beats": [
             {"type": "narration", "text": "이번에는 제가 먼저 읽지 않겠습니다. CAP, 세 소리를 이어 보세요. 생각 시간을 드릴게요."},
             {"type": "cue", "text": "[PAUSE 3 SEC]"},
+            {"type": "narration", "text": "네, C /k/, A /æ/, P /p/가 이어져 CAP이 됩니다."},
         ],
         "ending": {
             "beats": [
@@ -837,7 +844,9 @@ def test_092_case_m_format_neutrality_safe_included_in_full_check():
     checks = run_script_integrity_check(blueprint, blueprint["title"], blueprint["thumbnail_text"], script, script_text)
     assert "format_neutrality_safe" in checks
     assert "content_block_uniqueness_safe" in checks
-    assert len(checks) == 17
+    assert "practice_mini_success_progression_safe" in checks  # 09-4 addition
+    assert "mini_success_answer_barrier_safe" in checks  # 09-5 addition
+    assert len(checks) == 19
 
 
 # --------------------------------------------------------------------------
@@ -963,7 +972,8 @@ def _duplicating_script():
     script["sections"][4]["thinking_time_seconds"] = 3
     script["sections"][4]["required_content"] = ["CAP을 예시로 사용", "CAP에서 C가 /k/ 소리를 냄을 명시"]
     script["sections"][4]["beats"] = [
-        {"type": "narration", "text": "이제 마지막은 여러분 차례입니다. 이 단어 CAP에서는 C가 /k/ 소리를 냅니다. 세 소리를 직접 합쳐서 읽어보세요."}
+        {"type": "narration", "text": "이제 마지막은 여러분 차례입니다. 이 단어 CAP을 세 소리로 직접 합쳐서 읽어보세요."},
+        {"type": "narration", "text": "CAP에서는 C가 /k/ 소리를 냅니다."},
     ]
     script["mini_success_meta"] = {
         "learning_function": "MINI_SUCCESS", "purpose": "CAP 직접 읽기",
@@ -976,8 +986,9 @@ def _duplicating_script():
         )},
     }
     script["mini_success_beats"] = [
-        {"type": "narration", "text": "이제 마지막은 여러분 차례입니다. 이 단어 CAP에서는 C가 /k/ 소리를 냅니다. 세 소리를 직접 합쳐서 읽어보세요."},
+        {"type": "narration", "text": "이제 마지막은 여러분 차례입니다. 이 단어 CAP을 세 소리로 직접 합쳐서 읽어보세요."},
         {"type": "cue", "text": "[PAUSE 3 SEC]"},
+        {"type": "narration", "text": "CAP에서는 C가 /k/ 소리를 냅니다."},
     ]
     script["sections"][5]["learning_function"] = "RECAP"
     script["sections"][5]["beats"] = [
@@ -1186,7 +1197,9 @@ def test_093_case_q_existing_sixteen_checks_preserved():
     assert expected_09_2.issubset(checks.keys())
     assert len(expected_09_2) == 16
     assert "content_block_uniqueness_safe" in checks
-    assert len(checks) == 17
+    assert "practice_mini_success_progression_safe" in checks  # 09-4 addition
+    assert "mini_success_answer_barrier_safe" in checks  # 09-5 addition
+    assert len(checks) == 19
 
 
 # --------------------------------------------------------------------------
@@ -1231,3 +1244,313 @@ def test_093_case_s_all_existing_cli_commands_present():
         "run-all", "topics", "clicks", "packages", "blueprint", "script",
     }
     assert expected.issubset(command_names)
+
+
+# ---------------------------------------------------------------------------
+# 09-4: Content Script Mini Success Gate correction (spec section 23)
+# ---------------------------------------------------------------------------
+
+def _cb(content_block_id, learning_function, base_narration, viewer_action=None,
+        thinking_time_seconds=0, retention_type="open_loop"):
+    return {
+        "content_block_id": content_block_id,
+        "learning_function": learning_function,
+        "base_narration": base_narration,
+        "viewer_action": viewer_action,
+        "thinking_time_seconds": thinking_time_seconds,
+        "retention_intent": {"type": retention_type, "purpose": ""},
+    }
+
+
+def _blank_script():
+    return {"mini_success_beats": [], "mini_success_meta": {}, "ending": {"beats": []}}
+
+
+# CASE A
+def test_case_a_no_mini_success_block_fails():
+    blocks = [_cb("CB01", "PROBLEM_RECOGNITION", "문제 제기"), _cb("CB02", "RECAP", "정리")]
+    assert check_mini_success_present({}, _blank_script(), blocks) == "fail"
+
+
+# CASE B
+def test_case_b_mini_success_block_without_viewer_action_or_attempt_cue_fails():
+    blocks = [_cb("CB05", "MINI_SUCCESS", "화면의 단어를 확인해보세요. /m/ /æ/ /p/가 이어집니다.")]
+    assert check_mini_success_present({}, _blank_script(), blocks) == "fail"
+
+
+# CASE C
+def test_case_c_mini_success_with_viewer_action_but_no_answer_fails():
+    blocks = [_cb("CB05", "MINI_SUCCESS", "MAP을 직접 읽어보세요.", viewer_action="MAP을 직접 읽어본다")]
+    assert check_mini_success_present({}, _blank_script(), blocks) == "fail"
+
+
+# CASE D
+def test_case_d_answer_before_attempt_fails():
+    script = {
+        "mini_success_beats": [
+            {"type": "narration", "text": "MAP은 /mæp/입니다. 이제 직접 읽어보세요."},
+        ],
+        "mini_success_meta": {"viewer_action": "MAP을 직접 읽어본다"},
+    }
+    blocks = [_cb("CB05", "MINI_SUCCESS", "MAP은 /mæp/입니다. 이제 직접 읽어보세요.", viewer_action="MAP을 직접 읽어본다")]
+    assert check_mini_success_present({}, script, blocks) == "fail"
+
+
+# CASE E
+def test_case_e_full_structure_with_pause_and_answer_passes():
+    script = {
+        "mini_success_beats": [
+            {"type": "narration", "text": "MAP을 직접 읽어보세요."},
+            {"type": "cue", "text": "[PAUSE 3 SEC]"},
+            {"type": "narration", "text": "/m/ /æ/ /p/가 이어져 /mæp/입니다."},
+        ],
+        "mini_success_meta": {"viewer_action": "MAP을 직접 읽어본다"},
+    }
+    narration = "MAP을 직접 읽어보세요. /m/ /æ/ /p/가 이어져 /mæp/입니다."
+    blocks = [_cb("CB05", "MINI_SUCCESS", narration, viewer_action="MAP을 직접 읽어본다", thinking_time_seconds=3)]
+    assert check_mini_success_present({}, script, blocks) == "pass"
+
+
+# CASE F: current real MAP CB08 structure (unit-level, mirrors the actual DB content)
+def test_case_f_real_map_cb08_structure_passes():
+    script = {
+        "mini_success_beats": [
+            {"type": "narration", "text": "화면에 나오는 MAP 단어를 보면서, 세 소리를 순서대로 합쳐 3초 안에 직접 소리 내어 읽어보세요."},
+            {"type": "cue", "text": "[PAUSE 3 SEC]"},
+            {"type": "narration", "text": "네, /m/, /æ/, /p/가 이어져 /mæp/이 됩니다. 스스로 소리를 연결해 읽어내셨습니다."},
+        ],
+        "mini_success_meta": {"viewer_action": "정답 공개 전에 MAP 단어의 세 소리를 연결해 직접 소리 내어 읽어본다"},
+    }
+    narration = (
+        "화면에 나오는 MAP 단어를 보면서, 세 소리를 순서대로 합쳐 3초 안에 직접 소리 내어 읽어보세요. "
+        "네, /m/, /æ/, /p/가 이어져 /mæp/이 됩니다. 스스로 소리를 연결해 읽어내셨습니다."
+    )
+    blocks = [_cb(
+        "CB08", "MINI_SUCCESS", narration,
+        viewer_action="정답 공개 전에 MAP 단어의 세 소리를 연결해 직접 소리 내어 읽어본다", thinking_time_seconds=3,
+        retention_type="mini_success",
+    )]
+    assert check_mini_success_present({}, script, blocks) == "pass"
+
+
+# CASE G/H: [PAUSE N SEC] cue recognized as the attempt/answer boundary
+def test_case_g_h_pause_cue_used_as_attempt_answer_boundary():
+    beats_safe = [
+        {"type": "narration", "text": "직접 읽어보세요."},
+        {"type": "cue", "text": "[PAUSE 3 SEC]"},
+        {"type": "narration", "text": "/k/ /æ/ /p/입니다."},
+    ]
+    from research.script_writer import _answer_revealed_before_attempt
+
+    assert _answer_revealed_before_attempt(beats_safe) is False
+    beats_unsafe = [
+        {"type": "narration", "text": "/k/ /æ/ /p/입니다. 직접 읽어보세요."},
+        {"type": "cue", "text": "[PAUSE 3 SEC]"},
+    ]
+    assert _answer_revealed_before_attempt(beats_unsafe) is True
+
+
+# CASE J
+def test_case_j_practice_and_mini_success_different_targets_is_safe():
+    blocks = [
+        _cb("CB05", "PRACTICE", "단어 BAT에서 B는 /b/, A는 /æ/, T는 /t/ 소리를 냅니다."),
+        _cb("CB08", "MINI_SUCCESS", "MAP을 직접 읽어보세요.", viewer_action="MAP을 직접 읽어본다", thinking_time_seconds=3),
+    ]
+    assert check_practice_mini_success_progression_safe(blocks) == "pass"
+
+
+# CASE K (same as the real CB05->CB08 shape)
+def test_case_k_guided_practice_to_independent_mini_success_is_safe():
+    blocks = [
+        _cb("CB05", "PRACTICE", "단어 MAP에서 M은 /m/, A는 /æ/, P는 /p/ 소리를 냅니다."),
+        _cb("CB08", "MINI_SUCCESS", "MAP을 직접 읽어보세요.", viewer_action="MAP을 직접 읽어본다", thinking_time_seconds=3),
+    ]
+    assert check_practice_mini_success_progression_safe(blocks) == "pass"
+
+
+# CASE L
+def test_case_l_identical_target_action_timing_answer_is_duplication():
+    blocks = [
+        _cb("CB05", "PRACTICE", "MAP을 직접 읽어보세요. /m/ /æ/ /p/입니다.",
+            viewer_action="MAP을 직접 읽어본다", thinking_time_seconds=3),
+        _cb("CB08", "MINI_SUCCESS", "MAP을 직접 읽어보세요. /m/ /æ/ /p/입니다.",
+            viewer_action="MAP을 직접 읽어본다", thinking_time_seconds=3),
+    ]
+    assert check_practice_mini_success_progression_safe(blocks) == "fail"
+
+
+# CASE N/O: opening resolved in the last RECAP, short final sign-off doesn't defeat it
+def test_case_n_o_problem_resolved_in_recap_before_short_signoff():
+    blueprint = {"core_question": "왜 3글자 단어가 안 읽힐까?"}
+    blocks = [
+        _cb("CB01", "PROBLEM_RECOGNITION", "왜 3글자 단어가 안 읽힐까?"),
+        _cb("CB06", "RECAP", "오늘 배운 핵심을 정리하면, 왜 3글자 단어가 안 읽히는지 알 수 있었습니다."),
+        _cb("CB07", "RECAP", "다음 영상에서 만나요. 감사합니다."),
+    ]
+    assert check_ending_resolves_opening(blueprint, blocks) == "pass"
+
+
+# CASE P
+def test_case_p_no_resolution_anywhere_in_closing_region_stays_warning():
+    blueprint = {"core_question": "왜 3글자 단어가 안 읽힐까?"}
+    blocks = [
+        _cb("CB01", "PROBLEM_RECOGNITION", "왜 3글자 단어가 안 읽힐까?"),
+        _cb("CB06", "RECAP", "오늘도 즐거운 시간이었습니다."),
+        _cb("CB07", "RECAP", "다음에 만나요. 감사합니다."),
+    ]
+    assert check_ending_resolves_opening(blueprint, blocks) == "warning"
+
+
+# collect_closing_region unit coverage
+def test_collect_closing_region_includes_trailing_recap_mini_success_run():
+    blocks = [
+        _cb("CB01", "PROBLEM_RECOGNITION", "..."),
+        _cb("CB05", "PRACTICE", "..."),
+        _cb("CB06", "TRANSFER", "..."),
+        _cb("CB07", "RECAP", "정리1"),
+        _cb("CB08", "MINI_SUCCESS", "미니 성공", viewer_action="읽어본다"),
+        _cb("CB09", "RECAP", "정리2"),
+    ]
+    closing = collect_closing_region(blocks)
+    assert [cb["content_block_id"] for cb in closing] == ["CB07", "CB08", "CB09"]
+
+
+# ---------------------------------------------------------------------------
+# 09-5: mini_success_answer_barrier_safe -- TARGET ORTHOGRAPHY (bare word) is a safe pre-pause
+# prompt; only IPA/answer-pronunciation evidence before the pause is a real reveal (spec section
+# 10-11, CASE H-M).
+# ---------------------------------------------------------------------------
+
+def _mini_success_script(pre_pause_text, post_pause_text):
+    return {
+        "mini_success_beats": [
+            {"type": "narration", "text": pre_pause_text},
+            {"type": "cue", "text": "[PAUSE 3 SEC]"},
+            {"type": "narration", "text": post_pause_text},
+        ],
+        "mini_success_meta": {"viewer_action": "CAP을 직접 읽어본다"},
+    }
+
+
+def _mini_success_blocks(pre_pause_text, post_pause_text):
+    narration = f"{pre_pause_text} {post_pause_text}"
+    return [_cb("CB08", "MINI_SUCCESS", narration, viewer_action="CAP을 직접 읽어본다", thinking_time_seconds=3)]
+
+
+# CASE H
+def test_case_h_bare_target_spelling_before_pause_passes_barrier():
+    script = _mini_success_script("CAP을 직접 읽어보세요.", "정답을 확인해보겠습니다.")
+    blocks = _mini_success_blocks("CAP을 직접 읽어보세요.", "정답을 확인해보겠습니다.")
+    assert check_mini_success_answer_barrier_safe(script, blocks) == "pass"
+
+
+# CASE I
+def test_case_i_phoneme_breakdown_before_pause_fails_barrier():
+    script = _mini_success_script("C /k/, A /æ/, P /p/를 떠올리며 읽어보세요.", "정답입니다.")
+    blocks = _mini_success_blocks("C /k/, A /æ/, P /p/를 떠올리며 읽어보세요.", "정답입니다.")
+    assert check_mini_success_answer_barrier_safe(script, blocks) == "fail"
+
+
+# CASE J
+def test_case_j_combined_ipa_before_pause_fails_barrier():
+    script = _mini_success_script("/kæp/를 떠올리며 읽어보세요.", "정답입니다.")
+    blocks = _mini_success_blocks("/kæp/를 떠올리며 읽어보세요.", "정답입니다.")
+    assert check_mini_success_answer_barrier_safe(script, blocks) == "fail"
+
+
+# CASE L
+def test_case_l_phoneme_breakdown_after_pause_passes_barrier():
+    script = _mini_success_script("CAP을 직접 읽어보세요.", "C /k/, A /æ/, P /p/가 이어집니다.")
+    blocks = _mini_success_blocks("CAP을 직접 읽어보세요.", "C /k/, A /æ/, P /p/가 이어집니다.")
+    assert check_mini_success_answer_barrier_safe(script, blocks) == "pass"
+
+
+# CASE M
+def test_case_m_natural_answer_word_after_pause_passes_barrier():
+    script = _mini_success_script("CAP을 직접 읽어보세요.", "정답은 CAP입니다.")
+    blocks = _mini_success_blocks("CAP을 직접 읽어보세요.", "정답은 CAP입니다.")
+    assert check_mini_success_answer_barrier_safe(script, blocks) == "pass"
+
+
+def test_answer_barrier_safe_wired_into_full_integrity_check():
+    blueprint = _blueprint_dict()
+    script = _good_script_response()
+    from research.script_writer import render_script_text
+
+    script_text = render_script_text(script)
+    checks = run_script_integrity_check(blueprint, blueprint["title"], blueprint["thumbnail_text"], script, script_text)
+    assert checks["mini_success_answer_barrier_safe"] == "pass"
+
+
+def test_answer_barrier_no_mini_success_at_all_is_a_warning_not_a_crash():
+    assert check_mini_success_answer_barrier_safe(_blank_script(), []) == "warning"
+
+
+# ---------------------------------------------------------------------------
+# 09-5: practice_mini_success_progression_safe scaffold framing (spec section 32, CASE R/T/U)
+# ---------------------------------------------------------------------------
+
+# CASE R
+def test_case_r_full_ladder_guided_to_cap_independent_progression_passes():
+    blocks = [
+        _cb("CB02", "CORE_EXPLANATION", "CAT에서 C는 /k/, A는 /æ/, T는 /t/ 소리를 냅니다."),
+        _cb("CB03", "DEMONSTRATION", "BAT에서 B는 /b/, A는 /æ/, T는 /t/ 소리를 냅니다."),
+        _cb("CB04", "REINFORCEMENT", "BAG에서 B는 /b/, A는 /æ/, G는 /g/ 소리를 냅니다."),
+        _cb("CB05", "PRACTICE", "MAP에서 M은 /m/, A는 /æ/, P는 /p/ 소리를 냅니다."),
+        _cb("CB08", "MINI_SUCCESS", "CAP을 직접 읽어보세요.", viewer_action="CAP을 직접 읽어본다", thinking_time_seconds=3),
+    ]
+    assert check_practice_mini_success_progression_safe(blocks) == "pass"
+
+
+# CASE T
+def test_case_t_mini_success_scaffold_lower_than_practice_passes():
+    blocks = [
+        _cb("CB05", "PRACTICE", "MAP에서 M은 /m/, A는 /æ/, P는 /p/ 소리를 냅니다."),
+        _cb("CB08", "MINI_SUCCESS", "MAP을 직접 읽어보세요.", viewer_action="MAP을 직접 읽어본다", thinking_time_seconds=3),
+    ]
+    assert check_practice_mini_success_progression_safe(blocks) == "pass"
+
+
+# CASE U
+def test_case_u_mini_success_scaffold_not_lower_than_practice_with_same_target_fails():
+    blocks = [
+        _cb("CB05", "PRACTICE", "MAP을 직접 읽어보세요.", viewer_action="MAP을 직접 읽어본다", thinking_time_seconds=3),
+        _cb("CB08", "MINI_SUCCESS", "MAP을 직접 읽어보세요.", viewer_action="MAP을 직접 읽어본다", thinking_time_seconds=3),
+    ]
+    assert check_practice_mini_success_progression_safe(blocks) == "fail"
+
+
+# ---------------------------------------------------------------------------
+# Smoke-test against whatever the real, previously-generated latest DB row currently holds --
+# read-only, no Gemini call. This is deliberately not a hard content assertion: which real
+# video_scripts row is "latest" (and whether its Mini Success target has already been corrected
+# upstream at 08) can change between sessions as the real pipeline is re-run, so this only checks
+# that recheck_script_integrity runs cleanly and never mutates the stored score. Skips gracefully
+# if no real database is present in this environment.
+# ---------------------------------------------------------------------------
+
+def test_real_db_latest_script_recheck_runs_cleanly():
+    from pathlib import Path
+
+    db_path = Path("data/research.db")
+    if not db_path.exists():
+        return  # no real pipeline data in this environment -- nothing to recheck
+
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM video_scripts ORDER BY id DESC LIMIT 1").fetchone()
+    if row is None:
+        return
+    row = dict(row)
+
+    result = recheck_script_integrity(db_path, row)
+    checks = result["integrity_checks"]
+
+    assert set(checks.values()) <= {"pass", "warning", "fail"}
+    for key in ("mini_success_present", "practice_mini_success_progression_safe", "ending_resolves_opening"):
+        assert key in checks
+
+    # Script content itself must be untouched by this recheck.
+    assert result["script_score"] == row["script_score"]
+
+    if not any(status == "fail" for status in checks.values()):
+        assert result["ready_for_direction"] is True
