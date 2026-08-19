@@ -510,6 +510,9 @@ def cmd_assets(args, cfg):
         plan_id=args.plan_id, mode=mode,
         tts_model=cfg.get("gemini", "tts_model", default="gemini-3.1-flash-tts-preview"),
         max_segment_seconds=cfg.get("asset_generation", "max_segment_seconds", default=12),
+        primary_en_native_strategy=cfg.get("asset_generation", "primary_en_native_strategy", default="DIRECT_WORD"),
+        fallback_en_native_strategy=cfg.get("asset_generation", "fallback_en_native_strategy", default="CONTEXTUAL_WORD"),
+        default_blending_strategy=cfg.get("asset_generation", "default_blending_strategy", default="DIRECT_SEQUENCE"),
     )
     print(f"Asset generation report written to {path}")
     log_stage_done("ASSETS", str(path))

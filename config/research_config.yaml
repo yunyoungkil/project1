@@ -102,6 +102,11 @@ asset_generation:
   # 12-2 section 11: confirmed default beginner blending strategy -- documents the same value as
   # asset_generator.DEFAULT_BLENDING_STRATEGY so the policy isn't only visible in code.
   default_blending_strategy: DIRECT_SEQUENCE
+  # 12-4: real human review decision, confirmed via actual TTS samples in 12-2/12-3 -- config is
+  # the source of truth, the matching DEFAULT_EN_NATIVE_STRATEGY code constant is only a fallback
+  # for callers that don't load config (e.g. direct unit tests).
+  primary_en_native_strategy: DIRECT_WORD
+  fallback_en_native_strategy: CONTEXTUAL_WORD
   # `research direction` only asks for a short 3-gate judgment (podcast/clip/explanation
   # necessity) or, for PODCAST, a dialogue-beat script -- comparable to the blueprint prompt.
   max_output_tokens_direction: 6000

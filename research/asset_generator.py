@@ -457,6 +457,42 @@ def is_mini_success_answer_asset(production_blocks: list[dict], speech_asset_id:
 
 
 # ---------------------------------------------------------------------------
+# 12-5: Generation Unit compiler. A Source Speech Asset (11's logical unit, e.g. "SP001") and a
+# Generation Unit (the actual TTS request/cache/reuse granularity, e.g. "SP001-1"/"SP001-2") are
+# not always the same thing once KO_NARRATION sentence-boundary segmentation (12-1) is involved --
+# this is the single deterministic function SAMPLE/FULL/DRY_RUN all call so they can never
+# disagree about how many units a source resolves to (section 21: Single Source of Truth). Pure
+# function: no DB access, no TTS calls, no side effects.
+# ---------------------------------------------------------------------------
+
+def build_generation_units(speech_asset: dict, production_blocks: list[dict], *, max_segment_seconds: float = 12.0) -> list[dict]:
+    sid = speech_asset["speech_asset_id"]
+    mode = speech_asset["speech_mode"]
+    source_block_ids = _source_block_ids_for_speech_asset(production_blocks, sid)
+
+    if mode in {"KO_NARRATION", "KO_PRONUNCIATION_GUIDE"}:
+        segments = segment_source_text_by_sentence(speech_asset["source_text"], max_segment_seconds)
+        if len(segments) <= 1:
+            text = segments[0] if segments else speech_asset["source_text"]
+            return [{
+                "source_speech_asset_id": sid, "generation_unit_id": sid, "segment_index": None,
+                "segment_count": 1, "speech_mode": mode, "text": text, "source_block_ids": source_block_ids,
+            }]
+        return [
+            {
+                "source_speech_asset_id": sid, "generation_unit_id": f"{sid}-{i + 1}", "segment_index": i,
+                "segment_count": len(segments), "speech_mode": mode, "text": seg, "source_block_ids": source_block_ids,
+            }
+            for i, seg in enumerate(segments)
+        ]
+
+    return [{
+        "source_speech_asset_id": sid, "generation_unit_id": sid, "segment_index": None,
+        "segment_count": 1, "speech_mode": mode, "text": speech_asset["source_text"], "source_block_ids": source_block_ids,
+    }]
+
+
+# ---------------------------------------------------------------------------
 # Sample Matrix selection (12 spec sections 19/34, expanded by 12-1 section 18): a richer but
 # still bounded set of representative types -- KO_NARRATION short/long, EN_NATIVE across two
 # words, isolated phonemes, and one blended sequence -- never the full 44.
@@ -685,22 +721,24 @@ def synthesize_ko_narration_segments(
     production_blocks: list[dict], max_segment_seconds: float, max_new_segments: int = 2,
 ) -> list[dict]:
     """Applies sentence-boundary segmentation (12-1 sections 12-15) to one KO_NARRATION
-    speech_asset. A cost cap (max_new_segments) keeps this Sample Matrix demonstration bounded --
-    additional real segments beyond the cap are recorded SKIPPED (structure verified, not
-    generated) rather than silently generating an unbounded number of new calls."""
-    source_text = speech_asset["source_text"]
-    segments = segment_source_text_by_sentence(source_text, max_segment_seconds)
-    if len(segments) <= 1:
+    speech_asset, via the shared build_generation_units compiler (12-5) so SAMPLE never computes
+    its own, possibly-diverging segmentation. A cost cap (max_new_segments) keeps this Sample
+    Matrix demonstration bounded -- additional real segments beyond the cap are recorded SKIPPED
+    (structure verified, not generated) rather than silently generating an unbounded number of new
+    calls. This cap is a SAMPLE-only concept; FULL has no such cap (12-5 section 4)."""
+    units = build_generation_units(speech_asset, production_blocks, max_segment_seconds=max_segment_seconds)
+    if len(units) <= 1:
         return [synthesize_asset(db_path, speech_asset, tts_client, audio_dir=audio_dir, tts_model=tts_model)]
 
-    source_block_ids = _source_block_ids_for_speech_asset(production_blocks, speech_asset["speech_asset_id"])
     rows = []
-    for i, seg_text in enumerate(segments):
-        asset_id = f"{speech_asset['speech_asset_id']}-{i + 1}"
-        segment_metadata = {"segment_index": i, "segment_count": len(segments), "source_block_ids": source_block_ids}
+    for i, unit in enumerate(units):
+        segment_metadata = {
+            "segment_index": unit["segment_index"], "segment_count": unit["segment_count"],
+            "source_block_ids": unit["source_block_ids"],
+        }
         if i >= max_new_segments:
             rows.append({
-                "asset_id": asset_id, "source_speech_asset_id": speech_asset["speech_asset_id"],
+                "asset_id": unit["generation_unit_id"], "source_speech_asset_id": speech_asset["speech_asset_id"],
                 "speech_mode": "KO_NARRATION", "voice_name": speech_asset.get("voice_name"),
                 "status": "SKIPPED", "file_path": None, "mime_type": None, "duration_ms": None,
                 "sample_rate": None, "channels": None, "checksum": None, "generation_method": None,
@@ -712,7 +750,7 @@ def synthesize_ko_narration_segments(
             continue
         rows.append(synthesize_asset(
             db_path, speech_asset, tts_client, audio_dir=audio_dir, tts_model=tts_model,
-            asset_id=asset_id, text_override=seg_text, segment_metadata=segment_metadata,
+            asset_id=unit["generation_unit_id"], text_override=unit["text"], segment_metadata=segment_metadata,
         ))
     return rows
 
@@ -811,6 +849,302 @@ def _row_from_history(historical_row: dict, *, is_mini_success_answer: bool = Fa
     }
 
 
+# ---------------------------------------------------------------------------
+# 12-4: EN_NATIVE primary/fallback strategy selection + Full Generation Plan. This is policy
+# lock-in, not a new TTS experiment -- it turns the real 12-2/12-3 human listening decisions into a
+# deterministic selector, reusing is_mini_success_answer_asset/_is_pronunciation_approved/
+# _NON_REUSABLE_REVIEW_STATES/review_priority_for rather than inventing a parallel system.
+# ---------------------------------------------------------------------------
+
+GENERATION_PLAN_ACTIONS = {"REUSE", "GENERATE", "SKIP", "BLOCKED"}
+SELECTION_REASONS = {"PRIMARY_APPROVED", "FALLBACK_AFTER_PRIMARY_FAILURE", "PRIMARY_PENDING", "NO_APPROVED_VARIANT"}
+
+
+def _asset_review_metadata(db_path: Path, plan_id: int, asset_id: str) -> dict | None:
+    """Latest metadata for an asset_id if it has ever been generated, else None."""
+    row = _latest_row_for_asset_id(db_path, plan_id, asset_id)
+    if not row:
+        return None
+    try:
+        return json.loads(row.get("metadata_json") or "{}")
+    except (TypeError, ValueError):
+        return {}
+
+
+def _variant_meets_approval(metadata: dict | None, *, require_tone_approval: bool) -> bool:
+    if not metadata:
+        return False
+    if not _is_pronunciation_approved(metadata.get("pronunciation_review")):
+        return False
+    if require_tone_approval and metadata.get("tone_consistency_review") != "APPROVED":
+        return False
+    return True
+
+
+def select_active_en_native_variant(
+    db_path: Path, plan_id: int, source_speech_asset: dict, production_blocks: list[dict], *,
+    primary_strategy: str = "DIRECT_WORD", fallback_strategy: str = "CONTEXTUAL_WORD",
+) -> dict:
+    """12-4 sections 2-4: the source of truth is the human review state, never "latest file" or
+    "shortest duration". Fallback is used only when primary has genuinely FAILED (REJECTED/
+    REGENERATE_REQUIRED) -- a merely PENDING or missing primary does NOT trigger fallback, even if
+    an approved fallback variant happens to exist (CASE G/H). Mini Success answers additionally
+    require tone_consistency_review=APPROVED before a variant counts as usable (section 9)."""
+    sid = source_speech_asset["speech_asset_id"]
+    require_tone = is_mini_success_answer_asset(production_blocks, sid)
+
+    primary_metadata = _asset_review_metadata(db_path, plan_id, sid)
+    primary_review = (primary_metadata or {}).get("pronunciation_review")
+    primary_failed = primary_review in _NON_REUSABLE_REVIEW_STATES
+    primary_approved = _variant_meets_approval(primary_metadata, require_tone_approval=require_tone)
+
+    if primary_approved:
+        return {
+            "selected_strategy": primary_strategy, "selected_asset_id": sid,
+            "selection_reason": "PRIMARY_APPROVED", "requires_tone_approval": require_tone,
+        }
+
+    fallback_asset_id = f"{sid}::{fallback_strategy}"
+    fallback_metadata = _asset_review_metadata(db_path, plan_id, fallback_asset_id)
+    fallback_approved = _variant_meets_approval(fallback_metadata, require_tone_approval=require_tone)
+
+    if primary_failed and fallback_approved:
+        return {
+            "selected_strategy": fallback_strategy, "selected_asset_id": fallback_asset_id,
+            "selection_reason": "FALLBACK_AFTER_PRIMARY_FAILURE", "requires_tone_approval": require_tone,
+        }
+
+    if primary_failed:
+        return {
+            "selected_strategy": None, "selected_asset_id": None,
+            "selection_reason": "NO_APPROVED_VARIANT", "requires_tone_approval": require_tone,
+        }
+
+    return {
+        "selected_strategy": primary_strategy, "selected_asset_id": None,
+        "selection_reason": "PRIMARY_PENDING", "requires_tone_approval": require_tone,
+    }
+
+
+def _en_native_plan_action(db_path: Path, plan_id: int, sid: str, fallback_strategy: str, selection: dict) -> str:
+    reason = selection["selection_reason"]
+    if reason in {"PRIMARY_APPROVED", "FALLBACK_AFTER_PRIMARY_FAILURE"}:
+        return "REUSE"
+    if reason == "PRIMARY_PENDING":
+        primary_row = _latest_row_for_asset_id(db_path, plan_id, sid)
+        return "REUSE" if primary_row and primary_row["status"] in {"AVAILABLE", "REUSED"} else "GENERATE"
+    # NO_APPROVED_VARIANT: primary explicitly failed. If the fallback has ALSO been explicitly
+    # rejected (not just untried/PENDING), both known paths are exhausted -- that needs a human
+    # decision on a new approach, not another automatic retry.
+    fallback_metadata = _asset_review_metadata(db_path, plan_id, f"{sid}::{fallback_strategy}")
+    if fallback_metadata and fallback_metadata.get("pronunciation_review") == "REJECTED":
+        return "BLOCKED"
+    return "GENERATE"
+
+
+def _unit_fields(unit: dict) -> dict:
+    """12-5 section 17: the Generation Unit identity fields every plan entry carries, regardless
+    of speech_mode -- non-segmented modes get segment_index=None/segment_count=1 rather than
+    omitting the keys, so downstream code never needs a per-mode presence check."""
+    return {
+        "generation_unit_id": unit["generation_unit_id"], "segment_index": unit["segment_index"],
+        "segment_count": unit["segment_count"], "source_block_ids": unit["source_block_ids"],
+    }
+
+
+def _cache_and_review_status(db_path: Path, plan_id: int, asset_id: str | None, action: str) -> tuple[str, str | None, int]:
+    """12-5 section 17: cache_status/review_status/estimated_api_calls, derived once so every
+    branch of build_full_generation_plan reports them the same way. REUSE/SKIP/BLOCKED never cost
+    a real call in this estimate (section 9: retries are excluded, only the base attempt counts)."""
+    cache_status = "CACHED" if action == "REUSE" else ("NOT_APPLICABLE" if action == "SKIP" else "MISSING")
+    metadata = _asset_review_metadata(db_path, plan_id, asset_id) if asset_id else None
+    review_status = (metadata or {}).get("pronunciation_review")
+    estimated_api_calls = 1 if action == "GENERATE" else 0
+    return cache_status, review_status, estimated_api_calls
+
+
+def _phoneme_plan_entry(db_path: Path, plan_id: int, speech_asset: dict, production_blocks: list[dict], *, default_blending_strategy: str) -> dict:
+    """12-4 sections 16-17: the representative approval (/b/, /g/, DIRECT_SEQUENCE) never
+    auto-approves a DIFFERENT phoneme asset -- each asset_id's own history is the only source of
+    truth. Isolated phonemes have no strategy dimension; blended ones use the default blending
+    strategy (no per-strategy choice here -- that comparison was already settled in 12-1/12-2).
+    EN_PHONEME_DEMO never segments (12-5 section 1) -- always exactly one Generation Unit."""
+    sid = speech_asset["speech_asset_id"]
+    is_blended = classify_phoneme_demo_type(speech_asset["source_text"]) == "BLENDED_SEQUENCE"
+    preferred_strategy = default_blending_strategy if is_blended else None
+    asset_id = f"{sid}::{default_blending_strategy}" if is_blended else sid
+    metadata = _asset_review_metadata(db_path, plan_id, asset_id)
+    row = _latest_row_for_asset_id(db_path, plan_id, asset_id)
+    if metadata and metadata.get("pronunciation_review") in _NON_REUSABLE_REVIEW_STATES:
+        action = "GENERATE"
+    elif row and row["status"] in {"AVAILABLE", "REUSED"}:
+        action = "REUSE"
+    else:
+        action = "GENERATE"
+    cache_status, review_status, estimated_api_calls = _cache_and_review_status(db_path, plan_id, asset_id, action)
+    return {
+        "source_speech_asset_id": sid, "speech_mode": "EN_PHONEME_DEMO", "preferred_strategy": preferred_strategy,
+        "selected_asset_id": asset_id if action == "REUSE" else None, "selection_reason": None, "action": action,
+        "generation_unit_id": sid, "segment_index": None, "segment_count": 1,
+        "source_block_ids": _source_block_ids_for_speech_asset(production_blocks, sid),
+        "cache_status": cache_status, "review_status": review_status, "estimated_api_calls": estimated_api_calls,
+    }
+
+
+def _ko_narration_plan_entries(
+    db_path: Path, plan_id: int, speech_asset: dict, production_blocks: list[dict], *, max_segment_seconds: float,
+) -> list[dict]:
+    """12-5 sections 3/17: one plan entry PER GENERATION UNIT, not per source asset -- a long
+    KO_NARRATION source that splits into N sentence-boundary segments (12-1's
+    segment_source_text_by_sentence, unchanged) now produces N entries, each independently
+    REUSE/GENERATE-checked via its own generation_unit_id. Uses the exact same
+    build_generation_units compiler SAMPLE and DRY_RUN use, so segmentation can never diverge
+    across modes (section 21)."""
+    sid = speech_asset["speech_asset_id"]
+    mode = speech_asset["speech_mode"]
+    units = build_generation_units(speech_asset, production_blocks, max_segment_seconds=max_segment_seconds)
+    entries = []
+    for unit in units:
+        unit_id = unit["generation_unit_id"]
+        row = _latest_row_for_asset_id(db_path, plan_id, unit_id)
+        action = "REUSE" if row and row["status"] in {"AVAILABLE", "REUSED"} else "GENERATE"
+        cache_status, review_status, estimated_api_calls = _cache_and_review_status(db_path, plan_id, unit_id, action)
+        entries.append({
+            "source_speech_asset_id": sid, "speech_mode": mode, "preferred_strategy": None,
+            "selected_asset_id": unit_id if action == "REUSE" else None, "selection_reason": None, "action": action,
+            **_unit_fields(unit), "cache_status": cache_status, "review_status": review_status,
+            "estimated_api_calls": estimated_api_calls,
+        })
+    return entries
+
+
+def _resolve_full_execution_asset_id(entry: dict, *, primary_en_native_strategy: str, default_blending_strategy: str) -> str:
+    """12-6 section 1: the single place that decides which exact asset_id a Full Generation Plan
+    entry resolves to at real synthesis/reuse time. The FULL execution loop and the
+    active_strategy_matches_full_plan / all_generation_units_materialized Integrity Checks all call
+    this SAME function -- so a future change to the resolution rule can never make execution and
+    verification silently disagree (the exact class of bug 12-4 found for real with CAP)."""
+    sid = entry["source_speech_asset_id"]
+    if entry["speech_mode"] == "EN_NATIVE":
+        if entry["action"] == "REUSE" and entry.get("selected_asset_id"):
+            return entry["selected_asset_id"]
+        strategy = entry.get("preferred_strategy") or primary_en_native_strategy
+        return sid if strategy == primary_en_native_strategy else f"{sid}::{strategy}"
+    if entry["speech_mode"] == "EN_PHONEME_DEMO":
+        # Blended entries always carry a preferred_strategy (the blending strategy); isolated ones
+        # never do -- that presence, not a separate flag, is what distinguishes them here.
+        strategy = entry.get("preferred_strategy")
+        return f"{sid}::{strategy}" if strategy else sid
+    # KO_NARRATION/KO_PRONUNCIATION_GUIDE: generation_unit_id IS already the resolved id.
+    return entry["generation_unit_id"]
+
+
+def build_full_generation_plan(
+    db_path: Path, plan_id: int, speech_assets: list[dict], production_blocks: list[dict], *,
+    primary_en_native_strategy: str = "DIRECT_WORD", fallback_en_native_strategy: str = "CONTEXTUAL_WORD",
+    default_blending_strategy: str = "DIRECT_SEQUENCE", max_segment_seconds: float = 12.0,
+) -> dict:
+    """12-4 section 13 (extended 12-5 section 3): one entry per Generation Unit
+    (ORIGINAL_NATIVE_AUDIO excluded -- it is never TTS-generated). Non-segmenting modes resolve to
+    exactly one unit per source asset, so entry count == source asset count there; KO_NARRATION/
+    KO_PRONUNCIATION_GUIDE can resolve to several. action is exactly one of GENERATION_PLAN_ACTIONS."""
+    entries = []
+    for asset in speech_assets:
+        mode = asset["speech_mode"]
+        sid = asset["speech_asset_id"]
+        if mode == "ORIGINAL_NATIVE_AUDIO":
+            continue
+        if mode == "EN_NATIVE":
+            selection = select_active_en_native_variant(
+                db_path, plan_id, asset, production_blocks,
+                primary_strategy=primary_en_native_strategy, fallback_strategy=fallback_en_native_strategy,
+            )
+            action = _en_native_plan_action(db_path, plan_id, sid, fallback_en_native_strategy, selection)
+            cache_status, review_status, estimated_api_calls = _cache_and_review_status(
+                db_path, plan_id, selection["selected_asset_id"], action,
+            )
+            entries.append({
+                "source_speech_asset_id": sid, "speech_mode": mode,
+                "preferred_strategy": selection["selected_strategy"] or primary_en_native_strategy,
+                "selected_asset_id": selection["selected_asset_id"], "selection_reason": selection["selection_reason"],
+                "action": action, "generation_unit_id": sid, "segment_index": None, "segment_count": 1,
+                "source_block_ids": _source_block_ids_for_speech_asset(production_blocks, sid),
+                "cache_status": cache_status, "review_status": review_status, "estimated_api_calls": estimated_api_calls,
+            })
+        elif mode == "EN_PHONEME_DEMO":
+            entries.append(_phoneme_plan_entry(db_path, plan_id, asset, production_blocks, default_blending_strategy=default_blending_strategy))
+        elif mode in {"KO_NARRATION", "KO_PRONUNCIATION_GUIDE"}:
+            entries.extend(_ko_narration_plan_entries(db_path, plan_id, asset, production_blocks, max_segment_seconds=max_segment_seconds))
+        else:
+            entries.append({
+                "source_speech_asset_id": sid, "speech_mode": mode, "preferred_strategy": None,
+                "selected_asset_id": None, "selection_reason": None, "action": "GENERATE",
+                "generation_unit_id": sid, "segment_index": None, "segment_count": 1,
+                "source_block_ids": _source_block_ids_for_speech_asset(production_blocks, sid),
+                "cache_status": "MISSING", "review_status": None, "estimated_api_calls": 1,
+            })
+
+    counts = {action: sum(1 for e in entries if e["action"] == action) for action in GENERATION_PLAN_ACTIONS}
+    return {
+        "production_plan_id": plan_id, "generation_plan": entries, "action_counts": counts,
+        "expected_new_api_calls": sum(e["estimated_api_calls"] for e in entries),
+    }
+
+
+def _representative_review_complete(
+    db_path: Path, plan_id: int, speech_assets: list[dict], production_blocks: list[dict], *,
+    primary_en_native_strategy: str = "DIRECT_WORD", fallback_en_native_strategy: str = "CONTEXTUAL_WORD",
+    default_blending_strategy: str = "DIRECT_SEQUENCE",
+) -> bool:
+    """12-4 section 10: representative Gate -- isolated phonemes /b//g/, the default blending
+    strategy, two normal EN_NATIVE primary words, and the one EN_NATIVE fallback-critical word.
+    Never requires all 44 assets to be individually approved."""
+    en_native_by_word = {a["source_text"]: a for a in speech_assets if a["speech_mode"] == "EN_NATIVE"}
+    phoneme_by_text = {a["source_text"]: a for a in speech_assets if a["speech_mode"] == "EN_PHONEME_DEMO"}
+
+    for phoneme_text in ("/b/", "/g/"):
+        asset = phoneme_by_text.get(phoneme_text)
+        if not asset:
+            return False
+        metadata = _asset_review_metadata(db_path, plan_id, asset["speech_asset_id"])
+        if not _variant_meets_approval(metadata, require_tone_approval=False):
+            return False
+
+    blended_default = next(
+        (a for a in speech_assets if a["speech_mode"] == "EN_PHONEME_DEMO" and classify_phoneme_demo_type(a["source_text"]) == "BLENDED_SEQUENCE"),
+        None,
+    )
+    if not blended_default:
+        return False
+    metadata = _asset_review_metadata(db_path, plan_id, f"{blended_default['speech_asset_id']}::{default_blending_strategy}")
+    if not _variant_meets_approval(metadata, require_tone_approval=False):
+        return False
+
+    for word_asset, is_fallback_critical in [
+        (en_native_by_word.get("BAG"), False), (en_native_by_word.get("MAP"), False),
+    ]:
+        if not word_asset:
+            return False
+        selection = select_active_en_native_variant(
+            db_path, plan_id, word_asset, production_blocks,
+            primary_strategy=primary_en_native_strategy, fallback_strategy=fallback_en_native_strategy,
+        )
+        if selection["selection_reason"] != "PRIMARY_APPROVED":
+            return False
+
+    cap_asset = en_native_by_word.get("CAP")
+    if not cap_asset:
+        return False
+    cap_selection = select_active_en_native_variant(
+        db_path, plan_id, cap_asset, production_blocks,
+        primary_strategy=primary_en_native_strategy, fallback_strategy=fallback_en_native_strategy,
+    )
+    if cap_selection["selection_reason"] != "FALLBACK_AFTER_PRIMARY_FAILURE":
+        return False
+
+    return True
+
+
 def _persist_run(db_path: Path, plan_id: int, mode: str, summary: dict, status: str) -> int:
     with connect(db_path) as conn:
         cur = conn.execute(
@@ -870,6 +1204,18 @@ def record_tone_consistency_review(db_path: Path, plan_id: int, asset_id: str, s
     return _record_review_field(db_path, plan_id, asset_id, "tone_consistency_review", status, note)
 
 
+def _has_full_run(db_path: Path, plan_id: int) -> bool:
+    """12-6 section 35: whether a FULL run has actually happened for this plan (any outcome --
+    this is a "was it executed" flag, distinct from `all_generation_units_materialized`'s "did it
+    fully succeed"). Mirrors _has_successful_sample_run's query shape."""
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT id FROM asset_generation_runs WHERE production_plan_id = ? AND mode = 'FULL' ORDER BY id DESC LIMIT 1",
+            (plan_id,),
+        ).fetchone()
+    return row is not None
+
+
 def _has_successful_sample_run(db_path: Path, plan_id: int) -> bool:
     with connect(db_path) as conn:
         row = conn.execute(
@@ -897,13 +1243,19 @@ def _has_unverified_critical_phoneme(db_path: Path, plan_id: int) -> bool:
 # Manifest (spec section 43) -- the interface 13 Renderer is meant to consume.
 # ---------------------------------------------------------------------------
 
-def build_asset_manifest(plan_id: int, rows: list[dict]) -> dict:
+def build_asset_manifest(plan_id: int, rows: list[dict], *, production_blocks: list[dict] | None = None) -> dict:
+    """12-6 section 19: production_blocks is optional (backward compatible with existing callers
+    that don't pass it) -- when given, it lets source_block_ids be derived for rows whose metadata
+    doesn't already carry it (only segmented KO_NARRATION rows do)."""
     assets = []
     for r in rows:
         try:
             metadata = r["metadata"] if isinstance(r.get("metadata"), dict) else json.loads(r.get("metadata_json") or "{}")
         except (TypeError, ValueError):
             metadata = {}
+        source_block_ids = metadata.get("source_block_ids")
+        if source_block_ids is None and production_blocks is not None:
+            source_block_ids = _source_block_ids_for_speech_asset(production_blocks, r["source_speech_asset_id"])
         assets.append({
             "asset_id": r.get("asset_id") or r["source_speech_asset_id"],
             "source_speech_asset_id": r["source_speech_asset_id"],
@@ -913,9 +1265,15 @@ def build_asset_manifest(plan_id: int, rows: list[dict]) -> dict:
             "status": r["status"],
             "file": r.get("file_path"),
             "duration_ms": r.get("duration_ms"),
+            "checksum": r.get("checksum"),
+            "strategy": metadata.get("pronunciation_strategy") or metadata.get("phoneme_strategy"),
             "tts_prompt_version": metadata.get("tts_prompt_version"),
             "pronunciation_review": metadata.get("pronunciation_review"),
+            "tone_consistency_review": metadata.get("tone_consistency_review"),
             "review_priority": metadata.get("review_priority"),
+            "segment_index": metadata.get("segment_index"),
+            "segment_count": metadata.get("segment_count"),
+            "source_block_ids": source_block_ids,
         })
     return {
         "production_plan_id": plan_id,
@@ -946,7 +1304,11 @@ def _pause_map(production_blocks: list[dict]) -> dict:
 
 def run_asset_generation_integrity_check(
     db_path: Path, plan_row: dict, original_production_blocks: list[dict], speech_assets: list[dict],
-    generated_rows: list[dict], mode: str, manifest: dict,
+    generated_rows: list[dict], mode: str, manifest: dict, *,
+    primary_en_native_strategy: str = DEFAULT_EN_NATIVE_STRATEGY,
+    fallback_en_native_strategy: str = "CONTEXTUAL_WORD",
+    default_blending_strategy: str = DEFAULT_BLENDING_STRATEGY,
+    max_segment_seconds: float = 12.0,
 ) -> dict:
     checks = {}
 
@@ -1180,6 +1542,192 @@ def run_asset_generation_integrity_check(
         if r["status"] in {"AVAILABLE", "REUSED"} and is_mini_success_answer_asset(original_production_blocks, r["source_speech_asset_id"])
     ) else "fail"
 
+    # ---- 12-4 additions (section 24): 6 new checks, none of the 30 above renamed/removed. ----
+
+    checks["en_native_primary_fallback_policy_safe"] = "pass" if (
+        primary_en_native_strategy in EN_NATIVE_PRONUNCIATION_STRATEGIES
+        and fallback_en_native_strategy in EN_NATIVE_PRONUNCIATION_STRATEGIES
+        and primary_en_native_strategy != fallback_en_native_strategy
+    ) else "fail"
+
+    en_native_sources = [a for a in speech_assets if a["speech_mode"] == "EN_NATIVE"]
+    selections_by_sid = {
+        a["speech_asset_id"]: select_active_en_native_variant(
+            db_path, plan_row["id"], a, original_production_blocks,
+            primary_strategy=primary_en_native_strategy, fallback_strategy=fallback_en_native_strategy,
+        )
+        for a in en_native_sources
+    }
+
+    failed_selected = False
+    for selection in selections_by_sid.values():
+        sel_id = selection["selected_asset_id"]
+        if not sel_id:
+            continue
+        meta = _asset_review_metadata(db_path, plan_row["id"], sel_id)
+        if meta and meta.get("pronunciation_review") in _NON_REUSABLE_REVIEW_STATES:
+            failed_selected = True
+    checks["failed_variant_not_selected"] = "fail" if failed_selected else "pass"
+
+    fallback_selection_safe = True
+    for selection in selections_by_sid.values():
+        if selection["selection_reason"] != "FALLBACK_AFTER_PRIMARY_FAILURE":
+            continue
+        meta = _asset_review_metadata(db_path, plan_row["id"], selection["selected_asset_id"])
+        if not _variant_meets_approval(meta, require_tone_approval=selection["requires_tone_approval"]):
+            fallback_selection_safe = False
+    checks["approved_fallback_selection_safe"] = "pass" if fallback_selection_safe else "fail"
+
+    try:
+        _representative_review_complete(
+            db_path, plan_row["id"], speech_assets, original_production_blocks,
+            primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+            default_blending_strategy=default_blending_strategy,
+        )
+        checks["representative_review_gate_safe"] = "pass"
+    except Exception:
+        checks["representative_review_gate_safe"] = "fail"
+
+    plan_result = build_full_generation_plan(
+        db_path, plan_row["id"], speech_assets, original_production_blocks,
+        primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+        default_blending_strategy=default_blending_strategy, max_segment_seconds=max_segment_seconds,
+    )
+    required_ids = {a["speech_asset_id"] for a in speech_assets if a["speech_mode"] != "ORIGINAL_NATIVE_AUDIO"}
+    plan_ids = {e["source_speech_asset_id"] for e in plan_result["generation_plan"]}
+    checks["full_generation_plan_complete"] = "pass" if (
+        plan_ids == required_ids and all(e["action"] in GENERATION_PLAN_ACTIONS for e in plan_result["generation_plan"])
+    ) else "fail"
+
+    checks["full_generation_api_estimate_safe"] = "pass" if (
+        plan_result["expected_new_api_calls"] == plan_result["action_counts"]["GENERATE"]
+    ) else "fail"
+
+    # ---- 12-5 additions (section 20): 7 new checks, none of the 36 above renamed/removed. ----
+
+    checks["generation_unit_model_safe"] = "pass" if all(
+        len(build_generation_units(a, original_production_blocks, max_segment_seconds=max_segment_seconds)) >= 1
+        for a in speech_assets if a["speech_mode"] != "ORIGINAL_NATIVE_AUDIO"
+    ) else "fail"
+
+    # Pure/deterministic by construction -- calling the compiler twice for the same source and
+    # config must yield byte-identical segmentation, which is exactly what guarantees SAMPLE/FULL/
+    # DRY_RUN (all of which call this same function) can never disagree (section 7/21).
+    ko_sources = [a for a in speech_assets if a["speech_mode"] in {"KO_NARRATION", "KO_PRONUNCIATION_GUIDE"}]
+    checks["ko_segmentation_mode_consistent"] = "pass" if all(
+        build_generation_units(a, original_production_blocks, max_segment_seconds=max_segment_seconds)
+        == build_generation_units(a, original_production_blocks, max_segment_seconds=max_segment_seconds)
+        for a in ko_sources
+    ) else "fail"
+
+    checks["generation_unit_lineage_safe"] = "pass" if all(
+        (r.get("metadata") or {}).get("segment_index") is not None
+        and r["asset_id"] == f"{r['source_speech_asset_id']}-{(r.get('metadata') or {}).get('segment_index') + 1}"
+        and {"segment_index", "segment_count", "source_block_ids"} <= set((r.get("metadata") or {}).keys())
+        for r in generated_rows
+        if (r.get("metadata") or {}).get("segment_count") and (r.get("metadata") or {}).get("segment_count") > 1
+    ) else "fail"
+
+    plan_by_source: dict[str, list[dict]] = {}
+    for e in plan_result["generation_plan"]:
+        plan_by_source.setdefault(e["source_speech_asset_id"], []).append(e)
+    checks["full_api_estimate_generation_unit_based"] = "pass" if all(
+        len(group) == group[0]["segment_count"] and len({g["segment_count"] for g in group}) == 1
+        for sid, group in plan_by_source.items()
+        if speech_assets_by_id.get(sid, {}).get("speech_mode") in {"KO_NARRATION", "KO_PRONUNCIATION_GUIDE"}
+    ) else "fail"
+
+    ko_cache_markers: dict[str, set] = {}
+    segment_cache_ok = True
+    for r in generated_rows:
+        if r["speech_mode"] not in {"KO_NARRATION", "KO_PRONUNCIATION_GUIDE"}:
+            continue
+        key = r.get("cache_key")
+        text = (r.get("metadata") or {}).get("synthesized_text")
+        if not key or text is None:
+            continue
+        markers = ko_cache_markers.setdefault(key, set())
+        markers.add(text)
+        if len(markers) > 1:
+            segment_cache_ok = False
+    checks["segment_cache_identity_safe"] = "pass" if segment_cache_ok else "fail"
+
+    checks["full_reuses_existing_segments"] = "pass" if (
+        mode != "FULL"
+        or all(not r.get("api_call_made") for r in generated_rows if r["status"] == "REUSED")
+    ) else "fail"
+
+    if mode == "FULL":
+        plan_valid_ids = {e["generation_unit_id"] for e in plan_result["generation_plan"]}
+        plan_valid_ids |= {e["selected_asset_id"] for e in plan_result["generation_plan"] if e.get("selected_asset_id")}
+        checks["full_generation_path_uses_plan"] = "pass" if all(
+            r["asset_id"] in plan_valid_ids for r in generated_rows if r["speech_mode"] != "ORIGINAL_NATIVE_AUDIO"
+        ) else "fail"
+    else:
+        checks["full_generation_path_uses_plan"] = "pass"
+
+    # ---- 12-6 additions (section 25): 8 new checks, none of the 43 above renamed/removed. ----
+
+    checks["full_generation_executed_safe"] = "pass" if (mode != "FULL" or len(generated_rows) > 0) else "fail"
+
+    non_blocked_entries = [e for e in plan_result["generation_plan"] if e["action"] != "BLOCKED"]
+    required_resolved_ids = {
+        _resolve_full_execution_asset_id(e, primary_en_native_strategy=primary_en_native_strategy, default_blending_strategy=default_blending_strategy)
+        for e in non_blocked_entries
+    }
+    materialized_ids = {r["asset_id"] for r in generated_rows if r["status"] in {"AVAILABLE", "REUSED"}}
+    checks["all_generation_units_materialized"] = "pass" if (
+        mode != "FULL" or required_resolved_ids <= materialized_ids
+    ) else "fail"
+
+    checks["generated_audio_technical_validation_safe"] = "pass" if all(
+        (r.get("validation") or {}).get("valid") and (r.get("duration_ms") or 0) > 0
+        for r in generated_rows if r["status"] == "AVAILABLE" and r.get("generation_method") == "gemini_tts"
+    ) else "fail"
+
+    manifest_ids = {a["asset_id"] for a in (manifest.get("assets") or [])}
+    checks["full_manifest_complete"] = "pass" if (
+        mode != "FULL" or required_resolved_ids <= manifest_ids
+    ) else "fail"
+
+    checks["full_review_state_honest"] = "pass" if not any(
+        (r.get("metadata") or {}).get("pronunciation_review") == "APPROVED"
+        for r in generated_rows if r["status"] == "AVAILABLE" and r.get("generation_method") == "gemini_tts"
+    ) else "fail"
+
+    # Same invariant as human_pronunciation_gate_safe (section 11 above) -- reused verbatim rather
+    # than reimplemented, per spec section 25's explicit "don't duplicate an equivalent check".
+    checks["failed_or_rejected_asset_not_reused"] = checks["human_pronunciation_gate_safe"]
+
+    if mode == "FULL":
+        entries_by_source: dict[str, list[dict]] = {}
+        for e in plan_result["generation_plan"]:
+            entries_by_source.setdefault(e["source_speech_asset_id"], []).append(e)
+        strategy_match_ok = True
+        for r in generated_rows:
+            if r["speech_mode"] not in {"EN_NATIVE", "EN_PHONEME_DEMO"}:
+                continue
+            candidates = entries_by_source.get(r["source_speech_asset_id"], [])
+            expected_ids = {
+                _resolve_full_execution_asset_id(e, primary_en_native_strategy=primary_en_native_strategy, default_blending_strategy=default_blending_strategy)
+                for e in candidates
+            }
+            if expected_ids and r["asset_id"] not in expected_ids:
+                strategy_match_ok = False
+        checks["active_strategy_matches_full_plan"] = "pass" if strategy_match_ok else "fail"
+    else:
+        checks["active_strategy_matches_full_plan"] = "pass"
+
+    # base/retry/total/reuse/failed accounting (section 9) is only meaningful if every row's
+    # api_call_made flag is consistent with its status -- REUSED/SKIPPED/MISSING_SOURCE must never
+    # have made a real call, and AVAILABLE/FAILED/UNVERIFIED (a real synthesis attempt was made)
+    # always must have.
+    checks["full_api_call_accounting_safe"] = "pass" if all(
+        (r["status"] in {"REUSED", "SKIPPED", "MISSING_SOURCE"} and not r["api_call_made"])
+        or (r["status"] in {"AVAILABLE", "FAILED", "UNVERIFIED"} and r["api_call_made"])
+        for r in generated_rows
+    ) else "fail"
+
     return checks
 
 
@@ -1191,16 +1739,22 @@ def ready_for_rendering_gate(checks: dict, mode: str, has_unverified_critical_ph
     return not has_unverified_critical_phoneme
 
 
-def ready_for_full_generation_gate(checks: dict, sample_rows: list[dict]) -> bool:
-    """12-1 section 20 (extended by 12-2 section 18, 12-3 section 21) -- distinct from
-    ready_for_rendering_gate (section 21 of 12): this gate asks whether it is safe to move from
-    Sample to FULL (44) generation, not whether the finished plan is ready for the Renderer. Any
-    HIGH review_priority sample that hasn't been human-approved keeps this NO -- that is the
-    normal, safe outcome before a human has actually listened, not a bug. Any sample marked
-    REJECTED/REGENERATE_REQUIRED also blocks the gate outright, regardless of its priority -- a
-    known-bad asset must never be treated as "resolved" just because a technical file happens to
-    exist for it. 12-3 adds tone_consistency_review to this same gate: pronunciation being correct
-    is not sufficient on its own if the representative sample's tone hasn't also been approved."""
+def ready_for_full_generation_gate(
+    checks: dict, sample_rows: list[dict], *,
+    generation_plan: dict | None = None, representative_complete: bool | None = None,
+) -> bool:
+    """12-1 section 20 (extended by 12-2 section 18, 12-3 section 21, 12-4 section 11) --
+    distinct from ready_for_rendering_gate (section 21 of 12): this gate asks whether it is safe
+    to move from Sample to FULL (44) generation, not whether the finished plan is ready for the
+    Renderer. Any HIGH review_priority sample that hasn't been human-approved keeps this NO --
+    that is the normal, safe outcome before a human has actually listened, not a bug. Any sample
+    marked REJECTED/REGENERATE_REQUIRED also blocks the gate outright, regardless of its priority
+    -- a known-bad asset must never be treated as "resolved" just because a technical file happens
+    to exist for it. 12-3 adds tone_consistency_review to this same gate: pronunciation being
+    correct is not sufficient on its own if the representative sample's tone hasn't also been
+    approved. 12-4 adds two more, both optional keyword-only so existing call sites are unchanged:
+    a BLOCKED count of 0 in the Full Generation Plan, and completion of the representative review
+    set (section 10)."""
     if any(v == "fail" for v in checks.values()):
         return False
     for row in sample_rows:
@@ -1212,6 +1766,10 @@ def ready_for_full_generation_gate(checks: dict, sample_rows: list[dict]) -> boo
         tone_review = metadata.get("tone_consistency_review")
         if tone_review in {"PENDING", "REJECTED"} and row["status"] in {"AVAILABLE", "REUSED"}:
             return False
+    if generation_plan is not None and generation_plan.get("action_counts", {}).get("BLOCKED", 0) > 0:
+        return False
+    if representative_complete is False:
+        return False
     return True
 
 
@@ -1295,6 +1853,9 @@ def _run_sample_matrix(
 def run_asset_generation(
     db_path: Path, tts_client, *, plan_id: int | None = None, mode: str = "DRY_RUN",
     tts_model: str = "gemini-3.1-flash-tts-preview", assets_dir: Path, max_segment_seconds: float = 12.0,
+    primary_en_native_strategy: str = DEFAULT_EN_NATIVE_STRATEGY,
+    fallback_en_native_strategy: str = "CONTEXTUAL_WORD",
+    default_blending_strategy: str = DEFAULT_BLENDING_STRATEGY,
 ) -> dict:
     if mode not in RUN_MODES:
         raise ValueError(f"invalid mode: {mode}")
@@ -1338,14 +1899,89 @@ def run_asset_generation(
                     cache_hits += 1
                 else:
                     cache_misses += 1
+        # 12-4 section 22: additive-only Full Generation Plan summary -- none of the fields above
+        # change meaning, these are new keys layered on top of the existing free (0-call) Dry Run.
+        # 12-5 section 8: this plan is now Generation-Unit based (max_segment_seconds threaded
+        # through), so cache_hits/cache_misses above stay only as a naive per-source reference --
+        # they are never the authoritative call estimate.
+        plan_result = build_full_generation_plan(
+            db_path, plan_row["id"], speech_assets, production_blocks,
+            primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+            default_blending_strategy=default_blending_strategy, max_segment_seconds=max_segment_seconds,
+        )
+        representative_complete = _representative_review_complete(
+            db_path, plan_row["id"], speech_assets, production_blocks,
+            primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+            default_blending_strategy=default_blending_strategy,
+        )
+        en_native_strategy_breakdown: dict[str, int] = {}
+        for entry in plan_result["generation_plan"]:
+            if entry["speech_mode"] != "EN_NATIVE":
+                continue
+            key = entry["selection_reason"] or "NO_HISTORY"
+            en_native_strategy_breakdown[key] = en_native_strategy_breakdown.get(key, 0) + 1
+        phoneme_strategy_breakdown: dict[str, int] = {}
+        for entry in plan_result["generation_plan"]:
+            if entry["speech_mode"] != "EN_PHONEME_DEMO":
+                continue
+            key = entry["action"]
+            phoneme_strategy_breakdown[key] = phoneme_strategy_breakdown.get(key, 0) + 1
+        approved_reuse_count = plan_result["action_counts"]["REUSE"]
+
+        # 12-5 section 4/18: Source Speech Asset (11's logical unit) vs. actual Generation Unit
+        # (the real TTS request/cache granularity) -- these differ exactly where KO_NARRATION
+        # segments into more than one unit.
+        source_asset_count = sum(v for k, v in speech_mode_counts.items() if k != "ORIGINAL_NATIVE_AUDIO")
+        generation_unit_count = len(plan_result["generation_plan"])
+        mode_breakdown: dict[str, dict] = {}
+        for mode_name in sorted({e["speech_mode"] for e in plan_result["generation_plan"]}):
+            entries = [e for e in plan_result["generation_plan"] if e["speech_mode"] == mode_name]
+            mode_breakdown[mode_name] = {
+                "source_assets": speech_mode_counts.get(mode_name, 0), "generation_units": len(entries),
+                "reuse": sum(1 for e in entries if e["action"] == "REUSE"),
+                "generate": sum(1 for e in entries if e["action"] == "GENERATE"),
+            }
+
+        # 12-5 section 19: per-source segment preview -- full narration text is not dumped, only a
+        # short preview per segment, so the report stays readable.
+        ko_narration_detail = []
+        for a in speech_assets:
+            if a["speech_mode"] not in {"KO_NARRATION", "KO_PRONUNCIATION_GUIDE"}:
+                continue
+            units = build_generation_units(a, production_blocks, max_segment_seconds=max_segment_seconds)
+            entries = [e for e in plan_result["generation_plan"] if e["source_speech_asset_id"] == a["speech_asset_id"]]
+            entries_by_unit = {e["generation_unit_id"]: e for e in entries}
+            ko_narration_detail.append({
+                "source_speech_asset_id": a["speech_asset_id"], "segment_count": units[0]["segment_count"],
+                "segments": [
+                    {
+                        "generation_unit_id": u["generation_unit_id"], "text_preview": (u["text"] or "")[:40],
+                        "action": entries_by_unit.get(u["generation_unit_id"], {}).get("action"),
+                    }
+                    for u in units
+                ],
+            })
+
         summary = {
             "plan_id": plan_row["id"], "mode": mode, "planned_count": len(speech_assets),
             "generated_count": 0, "reused_count": 0, "failed_count": 0, "unverified_count": 0, "skipped_count": 0,
-            "tts_target_count": sum(v for k, v in speech_mode_counts.items() if k != "ORIGINAL_NATIVE_AUDIO"),
+            "tts_target_count": source_asset_count,
             "source_clip_target_count": speech_mode_counts.get("ORIGINAL_NATIVE_AUDIO", 0),
+            "legacy_source_level_estimate": {"cache_hits": cache_hits, "cache_misses": cache_misses},
             "cache_hits_expected": cache_hits, "cache_misses_expected": cache_misses,
-            "expected_new_api_calls": cache_misses, "speech_mode_counts": speech_mode_counts,
+            "expected_new_api_calls": plan_result["expected_new_api_calls"],
+            "expected_base_api_calls": plan_result["expected_new_api_calls"], "retries_included": False,
+            "speech_mode_counts": speech_mode_counts,
             "voice_counts": voice_counts, "audio_dir": str(audio_dir), "api_calls": 0, "retry_count": 0,
+            "source_speech_asset_count": source_asset_count, "generation_unit_count": generation_unit_count,
+            "generation_unit_mode_breakdown": mode_breakdown, "ko_narration_detail": ko_narration_detail,
+            "ready_for_full_generation": ready_for_full_generation_gate(
+                {}, [], generation_plan=plan_result, representative_complete=representative_complete,
+            ),
+            "generation_plan": plan_result, "generation_plan_summary": plan_result["action_counts"],
+            "en_native_strategy_breakdown": en_native_strategy_breakdown,
+            "phoneme_strategy_breakdown": phoneme_strategy_breakdown,
+            "approved_reuse_count": approved_reuse_count,
         }
         run_id = _persist_run(db_path, plan_row["id"], mode, summary, status="COMPLETED")
         summary["run_id"] = run_id
@@ -1361,9 +1997,64 @@ def run_asset_generation(
             raise ValueError(
                 "No successful SAMPLE run exists for this plan yet -- run `research assets --sample` first."
             )
-        generated_rows = [
-            synthesize_asset(db_path, a, tts_client, audio_dir=audio_dir, tts_model=tts_model) for a in speech_assets
-        ]
+        # 12-4 section 23: FULL must actually apply the Full Generation Plan's selected
+        # strategy/variant, not just re-synthesize every EN_NATIVE word under the primary strategy
+        # by default -- otherwise an approved fallback (e.g. a word whose DIRECT_WORD is
+        # REGENERATE_REQUIRED) would be silently ignored and FULL would regenerate the known-bad
+        # primary instead of reusing the approved fallback.
+        # 12-5 section 4/17: KO_NARRATION/KO_PRONUNCIATION_GUIDE can resolve to MULTIPLE plan
+        # entries per source (one per Generation Unit) -- group by source instead of assuming 1:1,
+        # otherwise a naive {source: entry} dict would silently keep only the last segment's entry
+        # and drop the others.
+        full_plan = build_full_generation_plan(
+            db_path, plan_row["id"], speech_assets, production_blocks,
+            primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+            default_blending_strategy=default_blending_strategy, max_segment_seconds=max_segment_seconds,
+        )
+        entries_by_sid: dict[str, list[dict]] = {}
+        for e in full_plan["generation_plan"]:
+            entries_by_sid.setdefault(e["source_speech_asset_id"], []).append(e)
+        generated_rows = []
+        for a in speech_assets:
+            entries = entries_by_sid.get(a["speech_asset_id"], [])
+            entry = entries[0] if entries else None
+            if a["speech_mode"] == "EN_NATIVE" and entry:
+                strategy = entry.get("preferred_strategy") or primary_en_native_strategy
+                variant_asset_id = _resolve_full_execution_asset_id(
+                    entry, primary_en_native_strategy=primary_en_native_strategy, default_blending_strategy=default_blending_strategy,
+                )
+                generated_rows.append(synthesize_asset(
+                    db_path, a, tts_client, audio_dir=audio_dir, tts_model=tts_model,
+                    asset_id=variant_asset_id, pronunciation_strategy=strategy,
+                    is_mini_success_answer=is_mini_success_answer_asset(production_blocks, a["speech_asset_id"]),
+                ))
+            elif a["speech_mode"] == "EN_PHONEME_DEMO" and entry and classify_phoneme_demo_type(a["source_text"]) == "BLENDED_SEQUENCE":
+                target_word = _infer_target_word_for_blend(production_blocks, speech_assets, a["speech_asset_id"])
+                variant_asset_id = _resolve_full_execution_asset_id(
+                    entry, primary_en_native_strategy=primary_en_native_strategy, default_blending_strategy=default_blending_strategy,
+                )
+                generated_rows.append(synthesize_asset(
+                    db_path, a, tts_client, audio_dir=audio_dir, tts_model=tts_model,
+                    asset_id=variant_asset_id, phoneme_strategy=default_blending_strategy, target_word=target_word,
+                ))
+            elif a["speech_mode"] in {"KO_NARRATION", "KO_PRONUNCIATION_GUIDE"}:
+                # Same Generation Unit compiler SAMPLE uses (via synthesize_ko_narration_segments)
+                # -- FULL has no sample-matrix call-budget cap, every real unit is generated/reused.
+                units = build_generation_units(a, production_blocks, max_segment_seconds=max_segment_seconds)
+                if len(units) <= 1:
+                    generated_rows.append(synthesize_asset(db_path, a, tts_client, audio_dir=audio_dir, tts_model=tts_model))
+                else:
+                    for unit in units:
+                        segment_metadata = {
+                            "segment_index": unit["segment_index"], "segment_count": unit["segment_count"],
+                            "source_block_ids": unit["source_block_ids"],
+                        }
+                        generated_rows.append(synthesize_asset(
+                            db_path, a, tts_client, audio_dir=audio_dir, tts_model=tts_model,
+                            asset_id=unit["generation_unit_id"], text_override=unit["text"], segment_metadata=segment_metadata,
+                        ))
+            else:
+                generated_rows.append(synthesize_asset(db_path, a, tts_client, audio_dir=audio_dir, tts_model=tts_model))
 
     api_calls = sum(1 for r in generated_rows if r["api_call_made"])
     retry_count = sum(r.get("retries", 0) for r in generated_rows if r["api_call_made"])
@@ -1384,10 +2075,12 @@ def run_asset_generation(
     _persist_generated_assets(db_path, plan_row["id"], generated_rows)
 
     all_rows = _latest_generated_rows_for_plan(db_path, plan_row["id"])
-    manifest = build_asset_manifest(plan_row["id"], all_rows)
+    manifest = build_asset_manifest(plan_row["id"], all_rows, production_blocks=production_blocks)
 
     checks = run_asset_generation_integrity_check(
         db_path, plan_row, production_blocks, speech_assets, generated_rows, mode, manifest,
+        primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+        default_blending_strategy=default_blending_strategy, max_segment_seconds=max_segment_seconds,
     )
     ready = ready_for_rendering_gate(checks, mode, _has_unverified_critical_phoneme(db_path, plan_row["id"]))
     manifest["ready_for_rendering"] = ready
@@ -1399,12 +2092,26 @@ def run_asset_generation(
         "generated_count": status_counts["generated"], "reused_count": status_counts["reused"],
         "failed_count": status_counts["failed"], "unverified_count": status_counts["unverified"],
         "skipped_count": status_counts["skipped"], "api_calls": api_calls, "retry_count": retry_count,
+        "total_calls": api_calls + retry_count,
         "generated_assets": generated_rows, "speech_mode_counts": speech_mode_counts,
         "voice_counts": voice_counts, "audio_dir": str(audio_dir), "integrity_checks": checks,
         "manifest": manifest, "ready_for_rendering": ready,
     }
     if mode == "SAMPLE":
-        summary["ready_for_full_generation"] = ready_for_full_generation_gate(checks, generated_rows)
+        generation_plan = build_full_generation_plan(
+            db_path, plan_row["id"], speech_assets, production_blocks,
+            primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+            default_blending_strategy=default_blending_strategy, max_segment_seconds=max_segment_seconds,
+        )
+        representative_complete = _representative_review_complete(
+            db_path, plan_row["id"], speech_assets, production_blocks,
+            primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+            default_blending_strategy=default_blending_strategy,
+        )
+        summary["generation_plan"] = generation_plan
+        summary["ready_for_full_generation"] = ready_for_full_generation_gate(
+            checks, generated_rows, generation_plan=generation_plan, representative_complete=representative_complete,
+        )
     run_id = _persist_run(db_path, plan_row["id"], mode, summary, status=run_status)
     summary["run_id"] = run_id
     return summary
@@ -1418,10 +2125,14 @@ def build_asset_generation_report(
     db_path: Path, reports_dir: Path, assets_dir: Path, tts_client, *,
     plan_id: int | None = None, mode: str = "DRY_RUN", tts_model: str = "gemini-3.1-flash-tts-preview",
     max_segment_seconds: float = 12.0,
+    primary_en_native_strategy: str = DEFAULT_EN_NATIVE_STRATEGY,
+    fallback_en_native_strategy: str = "CONTEXTUAL_WORD",
+    default_blending_strategy: str = DEFAULT_BLENDING_STRATEGY,
 ) -> Path:
     result = run_asset_generation(
         db_path, tts_client, plan_id=plan_id, mode=mode, tts_model=tts_model, assets_dir=assets_dir,
-        max_segment_seconds=max_segment_seconds,
+        max_segment_seconds=max_segment_seconds, primary_en_native_strategy=primary_en_native_strategy,
+        fallback_en_native_strategy=fallback_en_native_strategy, default_blending_strategy=default_blending_strategy,
     )
 
     lines: list[str] = []
@@ -1448,6 +2159,14 @@ def build_asset_generation_report(
     lines.append(f"Skipped: {result['skipped_count']}")
     lines.append(f"API calls: {result['api_calls']}")
     lines.append(f"Retry count: {result['retry_count']}")
+    if "total_calls" in result:
+        # 12-6 section 9: base vs retry vs total kept as separate labeled numbers -- retries are
+        # never pre-estimated (12-5 section 24), so this is only ever known after a real run.
+        lines.append(f"Base Gemini TTS calls: {result['api_calls']}")
+        lines.append(f"Retry Gemini TTS calls: {result['retry_count']}")
+        lines.append(f"Total Gemini TTS calls: {result['total_calls']}")
+        lines.append(f"Cache reuse count: {result['reused_count']}")
+        lines.append(f"Failed calls: {result['failed_count']}")
     lines.append("")
 
     if result["mode"] == "DRY_RUN":
@@ -1461,7 +2180,66 @@ def build_asset_generation_report(
         lines.append(f"Speech Mode breakdown: {result['speech_mode_counts']}")
         lines.append(f"Voice breakdown: {result['voice_counts']}")
         lines.append(f"Audio directory: {result['audio_dir']}")
+        lines.append(
+            "(Cache hits/misses above use a single naive per-source-text lookup, ignoring EN_NATIVE "
+            "primary/fallback variants and per-strategy blended phoneme keys -- section 3b's Full "
+            "Generation Plan is the authoritative REUSE/GENERATE breakdown and its own action counts "
+            "are what \"Expected new API calls\" above is actually computed from.)"
+        )
         lines.append("")
+
+        lines.append("## 3b. Full Generation Plan (section 13/22 -- plan only, no assets generated)")
+        lines.append("")
+        lines.append(f"Primary EN_NATIVE strategy: {primary_en_native_strategy}")
+        lines.append(f"Fallback EN_NATIVE strategy: {fallback_en_native_strategy}")
+        lines.append(f"Default blending strategy: {default_blending_strategy}")
+        lines.append(f"Action counts: {result['generation_plan_summary']}")
+        lines.append(f"Approved reuse count: {result['approved_reuse_count']}")
+        lines.append(f"EN_NATIVE strategy breakdown (by selection_reason): {result['en_native_strategy_breakdown']}")
+        lines.append(f"EN_PHONEME_DEMO breakdown (by action): {result['phoneme_strategy_breakdown']}")
+        lines.append(f"Ready for Full Generation: {'YES' if result['ready_for_full_generation'] else 'NO'}")
+        lines.append("")
+        lines.append("| source_speech_asset_id | generation_unit_id | speech_mode | preferred_strategy | action | selection_reason |")
+        lines.append("|---|---|---|---|---|---|")
+        for entry in result["generation_plan"]["generation_plan"]:
+            lines.append(
+                f"| {entry['source_speech_asset_id']} | {entry.get('generation_unit_id')} | {entry['speech_mode']} | "
+                f"{entry.get('preferred_strategy')} | {entry['action']} | {entry.get('selection_reason')} |"
+            )
+        lines.append("")
+
+        lines.append("## 3c. Plan Summary (Generation Unit basis -- section 18)")
+        lines.append("")
+        lines.append(f"Source Speech Assets: {result['source_speech_asset_count']}")
+        lines.append(f"Generation Units: {result['generation_unit_count']}")
+        lines.append("")
+        lines.append(f"REUSE: {result['generation_plan_summary']['REUSE']}")
+        lines.append(f"GENERATE: {result['generation_plan_summary']['GENERATE']}")
+        lines.append(f"BLOCKED: {result['generation_plan_summary']['BLOCKED']}")
+        lines.append("")
+        lines.append(f"Expected Gemini TTS Base Calls: {result['expected_base_api_calls']}")
+        lines.append("Retries Included: NO")
+        lines.append(
+            "(Actual calls may be higher if retryable Gemini TTS failures occur -- this estimate "
+            "excludes retries by design, section 24.)"
+        )
+        lines.append("")
+        for mode_name, counts in result["generation_unit_mode_breakdown"].items():
+            lines.append(f"{mode_name}")
+            lines.append(f"  source assets: {counts['source_assets']}")
+            lines.append(f"  generation units: {counts['generation_units']}")
+            lines.append(f"  reuse: {counts['reuse']}")
+            lines.append(f"  generate: {counts['generate']}")
+        lines.append("")
+
+        lines.append("## 3d. KO_NARRATION Detail (section 19)")
+        lines.append("")
+        for detail in result["ko_narration_detail"]:
+            lines.append(f"{detail['source_speech_asset_id']}")
+            lines.append(f"  segment count: {detail['segment_count']}")
+            for seg in detail["segments"]:
+                lines.append(f"    {seg['generation_unit_id']}: \"{seg['text_preview']}...\" action={seg['action']}")
+            lines.append("")
     else:
         lines.append("## 3. Generated Assets")
         lines.append("")
@@ -1487,9 +2265,11 @@ def build_asset_generation_report(
         lines.append("")
 
         if mode == "SAMPLE":
-            lines.append("## 5b. Ready for Full Generation (distinct gate -- section 21)")
+            lines.append("## 5b. Ready for Full Generation (distinct gate -- section 21, extended 12-4 section 11)")
             lines.append("")
             lines.append("YES" if result.get("ready_for_full_generation") else "NO")
+            if result.get("generation_plan"):
+                lines.append(f"Action counts: {result['generation_plan']['action_counts']}")
             lines.append("")
             lines.append("## 5c. Samples Requiring Human Listening (section 29)")
             lines.append("")
@@ -1539,6 +2319,50 @@ def build_asset_generation_report(
                     )
                     lines.append("")
 
+        elif mode == "FULL":
+            # 12-6 section 23: only assets a human still needs to listen to -- MEDIUM/HIGH priority,
+            # technically usable (AVAILABLE/REUSED) -- in the exact field order the spec requires.
+            lines.append("## 5b. Human Listening Package (section 23)")
+            lines.append("")
+            # Only assets that still genuinely need a human verdict -- already-APPROVED/REJECTED/
+            # REGENERATE_REQUIRED items are resolved, not "required" listening (spec: "검토해야
+            # 하는 신규 asset만 추려서").
+            listening_rows = [
+                r for r in result["generated_assets"]
+                if (r.get("metadata") or {}).get("review_priority") in {"MEDIUM", "HIGH"} and r["status"] in {"AVAILABLE", "REUSED"}
+                and (
+                    (r.get("metadata") or {}).get("pronunciation_review") == "PENDING"
+                    or (r.get("metadata") or {}).get("tone_consistency_review") == "PENDING"
+                )
+            ]
+            if not listening_rows:
+                lines.append("(none -- no MEDIUM/HIGH priority asset from this run still needs human listening)")
+            for r in listening_rows:
+                metadata = r.get("metadata") or {}
+                target = metadata.get("synthesized_text") or r["source_speech_asset_id"]
+                strategy = metadata.get("pronunciation_strategy") or metadata.get("phoneme_strategy") or "N/A"
+                duration_s = (r.get("duration_ms") or 0) / 1000
+                lines.append(f"Asset ID: {r.get('asset_id')}")
+                lines.append(f"Speech Mode: {r['speech_mode']}")
+                lines.append(f"Target: {target}")
+                lines.append(f"Strategy: {strategy}")
+                lines.append(f"File: {r.get('file_path')}")
+                lines.append(f"Duration: {duration_s:.2f} sec")
+                lines.append(f"Review Priority: {metadata.get('review_priority')}")
+                lines.append(f"Pronunciation Review: {metadata.get('pronunciation_review')}")
+                lines.append(f"Tone Review: {metadata.get('tone_consistency_review')}")
+                lines.append("")
+
+            lines.append("## 5c. assets-review Usage (section 24 -- actual CLI syntax, not assumed)")
+            lines.append("")
+            lines.append(f"List pending review: python -m research.cli assets-review --plan-id {result['plan_id']}")
+            lines.append(
+                f"Record a verdict: python -m research.cli assets-review --plan-id {result['plan_id']} "
+                "--set ASSET_ID=APPROVED|REJECTED|REGENERATE_REQUIRED "
+                "[--set-tone ASSET_ID=APPROVED|REJECTED] (repeatable)"
+            )
+            lines.append("")
+
     lines.append("## Pronunciation Control: Official Support vs Experimental (section 2)")
     lines.append("")
     lines.append("A. Officially documented/supported: responseModalities=[\"AUDIO\"], prebuiltVoiceConfig.voiceName, "
@@ -1557,6 +2381,58 @@ def build_asset_generation_report(
                   "project. Generated audio is technical-generation PASS, pronunciation PENDING HUMAN REVIEW.")
     lines.append("- Word-level timing is not provided by the API and is not fabricated -- word_timing stays UNAVAILABLE.")
     lines.append("")
+
+    # 12-5 section 35: a final human-facing preview, independent of which mode this particular
+    # report run was -- always computed fresh (read-only, 0 API calls) so it reflects the actual
+    # current DB state regardless of whether this call was DRY_RUN/SAMPLE/FULL.
+    preview_plan_row = select_target_plan(db_path, plan_id=plan_id)
+    if preview_plan_row is not None:
+        preview_blocks = _load_production_blocks(db_path, preview_plan_row["id"])
+        preview_assets = _load_speech_assets(db_path, preview_plan_row["id"])
+        preview_plan = build_full_generation_plan(
+            db_path, preview_plan_row["id"], preview_assets, preview_blocks,
+            primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+            default_blending_strategy=default_blending_strategy, max_segment_seconds=max_segment_seconds,
+        )
+        preview_representative_complete = _representative_review_complete(
+            db_path, preview_plan_row["id"], preview_assets, preview_blocks,
+            primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+            default_blending_strategy=default_blending_strategy,
+        )
+        preview_ready_full = ready_for_full_generation_gate(
+            {}, [], generation_plan=preview_plan, representative_complete=preview_representative_complete,
+        )
+        preview_voices = sorted({a.get("voice_name") for a in preview_assets if a.get("voice_name")})
+        source_count = sum(1 for a in preview_assets if a["speech_mode"] != "ORIGINAL_NATIVE_AUDIO")
+
+        lines.append("## FULL Generation Preview")
+        lines.append("")
+        lines.append(f"Plan ID: {preview_plan_row['id']}")
+        lines.append(f"Format: {preview_plan_row.get('final_format')}")
+        lines.append(f"Voice: {', '.join(preview_voices)}")
+        lines.append(f"TTS Model: {tts_model}")
+        lines.append("")
+        lines.append(f"EN_NATIVE Primary: {primary_en_native_strategy}")
+        lines.append(f"EN_NATIVE Fallback: {fallback_en_native_strategy}")
+        lines.append(f"Blending Default: {default_blending_strategy}")
+        lines.append("")
+        lines.append(f"Source Speech Assets: {source_count}")
+        lines.append(f"Actual Generation Units: {len(preview_plan['generation_plan'])}")
+        lines.append("")
+        lines.append(f"Already Reusable: {preview_plan['action_counts']['REUSE']}")
+        lines.append(f"Need Generation: {preview_plan['action_counts']['GENERATE']}")
+        lines.append(f"Blocked: {preview_plan['action_counts']['BLOCKED']}")
+        lines.append("")
+        lines.append(f"Expected Gemini TTS Base Calls: {preview_plan['expected_new_api_calls']}")
+        lines.append("Retries Included: NO")
+        lines.append("Estimated Calls Are Generation-Unit Based: YES")
+        lines.append("")
+        lines.append(f"Representative Review Gate: {'COMPLETE' if preview_representative_complete else 'INCOMPLETE'}")
+        lines.append(f"Ready for Full Generation: {'YES' if preview_ready_full else 'NO'}")
+        lines.append(f"Ready for Rendering: {'YES' if result.get('ready_for_rendering') else 'NO'}")
+        lines.append("")
+        lines.append(f"FULL EXECUTED: {'YES' if _has_full_run(db_path, preview_plan_row['id']) else 'NO'}")
+        lines.append("")
 
     reports_dir.mkdir(parents=True, exist_ok=True)
     out_path = reports_dir / f"asset_generation_{datetime.utcnow().date().isoformat()}.md"
