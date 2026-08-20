@@ -45,7 +45,7 @@ from research.timeline_compiler import run_timeline_compiler
 from research.topic_candidates import build_topic_candidates_report
 from research.tts_client import GeminiTTSClient
 from research.video_director import build_video_direction_report
-from research.visual_design import CANDIDATES, run_approve_visual_design, run_correct_visual_approval, run_font_family_review, run_visual_design
+from research.visual_design import CANDIDATES, run_approve_visual_design, run_correct_visual_approval, run_font_family_human_approval, run_font_family_review, run_visual_design
 from research.weekly_report import build_weekly_report
 from research.youtube_client import YouTubeClient
 from research.youtube_search import estimate_search_units, run_category_search
@@ -706,6 +706,24 @@ def cmd_review_font_family(args, cfg):
     return result["report_path"]
 
 
+def cmd_approve_font_family(args, cfg):
+    log_stage_start("APPROVE-FONT-FAMILY", "13-4C-3 Font Review Prototype에 대한 Human Review 결과 font_family category만 승인 (신규 API 호출 없음)")
+    result = run_font_family_human_approval(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id)
+    if not result["pass"]:
+        print("Approve Font Family: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        log_stage_done("APPROVE-FONT-FAMILY", "blocked")
+        return None
+    print(f"approved_visual_profile.json written to {result['json_path']}")
+    print(f"Report written to {result['report_path']}")
+    print(f"Approved font_family: {result['approved_font_family']} ({result['font_stack']})")
+    print(f"Category approvals: {result['approved_category_count']} APPROVED / {result['pending_category_count']} PENDING")
+    print(f"Full Profile Approved: {'YES' if result['full_profile_approved'] else 'NO'}")
+    print(f"Ready for Final Renderer Binding: {'YES' if result['ready_for_final_renderer_binding'] else 'NO'}")
+    log_stage_done("APPROVE-FONT-FAMILY", str(result["report_path"]))
+    return result["report_path"]
+
+
 def cmd_run_scheduled(args, cfg):
     weekday = datetime.now().strftime("%A").lower()
     task = cfg.get("schedule", weekday)
@@ -866,6 +884,10 @@ def build_parser() -> argparse.ArgumentParser:
     review_font_family = sub.add_parser("review-font-family", help="Generate a Font Family comparison Prototype for CLEAN_DARK_FOCUS (no new API calls, no DB writes)")
     review_font_family.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
     review_font_family.set_defaults(func=cmd_review_font_family)
+
+    approve_font_family = sub.add_parser("approve-font-family", help="Persist the real Human Review font_family approval (VERDANA_HUMANIST only, no new API calls)")
+    approve_font_family.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    approve_font_family.set_defaults(func=cmd_approve_font_family)
 
     sub.add_parser("run-scheduled", help="Run today's scheduled task from config").set_defaults(func=cmd_run_scheduled)
 

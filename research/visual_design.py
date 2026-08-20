@@ -1373,3 +1373,149 @@ def _build_font_review_report(reports_dir: Path, plan_id: int, result: dict) -> 
     out_path = reports_dir / f"font_family_review_{datetime.utcnow().date().isoformat()}.md"
     out_path.write_text("\n".join(lines), encoding="utf-8")
     return out_path
+
+
+# ---------------------------------------------------------------------------
+# 13-4C-6: Font Family Human Approval -- persists exactly the font_family category as APPROVED,
+# based on the real Human Review decision on the 13-4C-3 Font Family Prototype (VERDANA_HUMANIST).
+# This is the ONLY font candidate with an actual recorded Human Review decision behind it;
+# approving ARIAL_NEUTRAL or SEGOE_MODERN here would fabricate a decision that was never made, so
+# this function structurally refuses any other candidate rather than trusting a caller-supplied one.
+# Append-only: writes a new visual_design_specs row on top of the current canonical
+# CANONICAL_CORRECTION record (found via select_canonical_visual_approval, never a hardcoded id),
+# carrying every other category forward exactly as it already stood. full_profile_approved is always
+# False here (a single category approval is never a full-profile approval by definition), and
+# ready_for_final_renderer_binding is recomputed via the real ready_for_final_renderer_binding gate,
+# which is also False since the other 8 MANDATORY_VISUAL_CATEGORIES members remain PENDING.
+# ---------------------------------------------------------------------------
+
+HUMAN_REVIEWED_FONT_FAMILY = "VERDANA_HUMANIST"
+
+
+def run_font_family_human_approval(
+    db_path: Path, assets_dir: Path, reports_dir: Path, *, plan_id: int | None = None,
+    approved_font_family: str = HUMAN_REVIEWED_FONT_FAMILY,
+) -> dict:
+    entry_gate = validate_visual_design_entry_gate(db_path, assets_dir, plan_id=plan_id)
+    if not entry_gate["pass"]:
+        return {"pass": False, "reason": entry_gate["reason"], "plan_id": entry_gate.get("plan_id")}
+    pid = entry_gate["plan_id"]
+
+    if approved_font_family not in FONT_CANDIDATES:
+        return {"pass": False, "reason": f"{approved_font_family!r} is not a real Font Review candidate (choices: {sorted(FONT_CANDIDATES)})", "plan_id": pid}
+
+    if approved_font_family != HUMAN_REVIEWED_FONT_FAMILY:
+        return {
+            "pass": False,
+            "reason": (
+                f"No recorded Human Review decision for {approved_font_family!r} -- only "
+                f"{HUMAN_REVIEWED_FONT_FAMILY!r} has an actual Human Review approval on record."
+            ),
+            "plan_id": pid,
+        }
+
+    canonical = select_canonical_visual_approval(db_path, pid)
+    if canonical is None:
+        return {"pass": False, "reason": "No canonical CANONICAL_CORRECTION visual_design_specs row found -- run `correct-visual-approval` first.", "plan_id": pid}
+
+    prior_id, prior_record = canonical["id"], canonical["design"]
+    prior_categories = prior_record.get("category_approvals", {})
+    font_stack = FONT_CANDIDATES[approved_font_family]["stack"]
+
+    new_categories = dict(prior_categories)
+    new_categories["font_family"] = {
+        "resolved_style": font_stack,
+        "resolution_status": "APPROVED",
+        "reason": "Human Review approved on the 13-4C-3 Font Family Prototype",
+        "provenance": {
+            "review_stage": "13-4C-6",
+            "review_type": "HUMAN_VISUAL_REVIEW",
+            "review_source": "13-4C-3 Font Family Prototype",
+            "selected_candidate": approved_font_family,
+            "visual_candidate": prior_record.get("selected_candidate"),
+            "human_decision": "APPROVED",
+        },
+    }
+
+    candidate_selection = {
+        "selected_candidate": prior_record.get("selected_candidate"),
+        "candidate_selection_status": prior_record.get("candidate_selection_status"),
+    }
+    ready = ready_for_final_renderer_binding(candidate_selection, {"categories": new_categories})
+    approved_count = sum(1 for c in new_categories.values() if c["resolution_status"] == "APPROVED")
+    pending_count = len(new_categories) - approved_count
+
+    new_record = {
+        **prior_record,
+        "record_status": "CANONICAL_CORRECTION",
+        "revision": "13-4C-6",
+        "corrects_record_id": prior_id,
+        "correction_reason": "FONT_FAMILY_HUMAN_APPROVAL",
+        "correction_details": (
+            f"font_family Human Review approved ({approved_font_family}); every other category is carried "
+            f"forward unchanged from record id={prior_id}."
+        ),
+        "category_approvals": new_categories,
+        "full_profile_approved": False,
+        "ready_for_final_renderer_binding": ready,
+    }
+
+    row_id = persist_visual_design(db_path, pid, prior_id, new_record, {"checks": {}, "unresolved_critical": [], "unresolved_non_critical": []})
+
+    profile_path = assets_dir / "generated" / f"plan_{pid}" / "render" / "approved_visual_profile.json"
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text(json.dumps(new_record, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    report_path = _build_font_family_approval_report(reports_dir, pid, new_record, approved_count, pending_count, prior_id, row_id, profile_path)
+
+    return {
+        "pass": True, "plan_id": pid, "approved_font_family": approved_font_family, "font_stack": font_stack,
+        "record": new_record, "prior_canonical_id": prior_id, "visual_design_row_id": row_id,
+        "approved_category_count": approved_count, "pending_category_count": pending_count,
+        "full_profile_approved": False, "ready_for_final_renderer_binding": ready,
+        "json_path": profile_path, "report_path": report_path,
+    }
+
+
+def _build_font_family_approval_report(
+    reports_dir: Path, plan_id: int, record: dict, approved_count: int, pending_count: int,
+    prior_id: int, row_id: int, profile_path: Path,
+) -> Path:
+    lines: list[str] = ["# Font Family Human Approval Report", ""]
+    lines.append(f"생성일: {datetime.utcnow().date().isoformat()}")
+    lines.append(f"Source Plan: {plan_id}")
+    lines.append("")
+    lines.append("## Human Review 대상")
+    lines.append("")
+    lines.append("비교한 3개 Font 후보: VERDANA_HUMANIST, ARIAL_NEUTRAL, SEGOE_MODERN (13-4C-3 Font Review Prototype)")
+    lines.append(f"선택된 Font: {record['category_approvals']['font_family']['provenance']['selected_candidate']}")
+    lines.append(f"실제 Font Stack: {record['category_approvals']['font_family']['resolved_style']}")
+    lines.append(f"Human Review provenance: {json.dumps(record['category_approvals']['font_family']['provenance'], ensure_ascii=False)}")
+    lines.append("")
+    lines.append("## Typography Scale (불변)")
+    lines.append("")
+    lines.append(f"PRIMARY: {CANDIDATES['CLEAN_DARK_FOCUS']['roles']['PRIMARY']} -- 이번 단계에서 변경되지 않음")
+    lines.append(f"typography_scale status: {record['category_approvals'].get('typography_scale', {}).get('resolution_status')}")
+    lines.append("")
+    lines.append(f"## Category Approvals ({approved_count} APPROVED / {pending_count} PENDING)")
+    lines.append("")
+    for name, cat in record["category_approvals"].items():
+        lines.append(f"- {name}: {cat['resolution_status']}")
+    lines.append("")
+    lines.append("## Renderer Gate")
+    lines.append("")
+    lines.append(f"Full Profile Approved: {'YES' if record['full_profile_approved'] else 'NO'}")
+    lines.append(f"Ready for Final Renderer Binding: {'YES' if record['ready_for_final_renderer_binding'] else 'NO'}")
+    lines.append("")
+    lines.append("## DB Append-only")
+    lines.append("")
+    lines.append(f"이전 canonical record id: {prior_id} (수정되지 않음)")
+    lines.append(f"신규 canonical record id: {row_id}")
+    lines.append("")
+    lines.append(f"JSON: {profile_path}")
+    lines.append("")
+
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    out_path = reports_dir / f"font_family_human_approval_{datetime.utcnow().date().isoformat()}.md"
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return out_path

@@ -19,10 +19,12 @@ from research.visual_design import (
     build_font_learning_prototype,
     build_visual_design,
     classify_visual_review,
+    HUMAN_REVIEWED_FONT_FAMILY,
     generate_font_review_prototypes,
     ready_for_final_renderer_binding,
     run_approve_visual_design,
     run_correct_visual_approval,
+    run_font_family_human_approval,
     run_font_family_review,
     run_visual_design,
     run_visual_design_integrity_check,
@@ -1159,3 +1161,207 @@ def test_run_font_family_review_fails_without_scene_layout(tmp_path):
     init_db(db_path)
     result = run_font_family_review(db_path, tmp_path / "assets", tmp_path / "reports", plan_id=1)
     assert result["pass"] is False
+
+
+# ---------------------------------------------------------------------------
+# 13-4C-6: Font Family Human Approval -- persists only font_family=APPROVED (VERDANA_HUMANIST) on
+# top of the current canonical CANONICAL_CORRECTION record, append-only, every other category
+# untouched, full_profile_approved/ready_for_final_renderer_binding both stay False.
+# ---------------------------------------------------------------------------
+
+def _ready_plan_with_canonical_correction(tmp_path, db_path):
+    plan_id, assets_dir, reports_dir = _make_ready_plan_with_scene_layout(tmp_path, db_path)
+    legacy_id, correction = _approve_then_correct(tmp_path, db_path, assets_dir, reports_dir, plan_id)
+    return plan_id, assets_dir, reports_dir, legacy_id, correction
+
+
+# end-to-end: font_family becomes APPROVED with the real code font stack, provenance recorded,
+# every other category preserved PENDING, gates stay False, append-only (new row, prior untouched)
+def test_run_font_family_human_approval_end_to_end(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, legacy_id, correction = _ready_plan_with_canonical_correction(tmp_path, db_path)
+    prior_canonical_id = correction["visual_design_row_id"]
+
+    with connect(db_path) as conn:
+        before = conn.execute("SELECT COUNT(*) c FROM visual_design_specs WHERE production_plan_id = ?", (plan_id,)).fetchone()["c"]
+        prior_design_json_before = conn.execute("SELECT design_json FROM visual_design_specs WHERE id = ?", (prior_canonical_id,)).fetchone()["design_json"]
+
+    result = run_font_family_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    assert result["pass"] is True
+    assert result["approved_font_family"] == "VERDANA_HUMANIST"
+    assert result["font_stack"] == FONT_CANDIDATES["VERDANA_HUMANIST"]["stack"]
+    assert result["record"]["category_approvals"]["font_family"]["resolution_status"] == "APPROVED"
+    assert result["record"]["category_approvals"]["font_family"]["resolved_style"] == FONT_CANDIDATES["VERDANA_HUMANIST"]["stack"]
+    assert result["record"]["category_approvals"]["font_family"]["provenance"]["review_stage"] == "13-4C-6"
+    assert result["record"]["category_approvals"]["font_family"]["provenance"]["review_type"] == "HUMAN_VISUAL_REVIEW"
+    assert result["record"]["selected_candidate"] == "CLEAN_DARK_FOCUS"
+
+    # every other category preserved exactly (still PENDING_VISUAL_REVIEW, matching the real fixture)
+    for name, cat in result["record"]["category_approvals"].items():
+        if name == "font_family":
+            continue
+        assert cat["resolution_status"] == "PENDING_VISUAL_REVIEW"
+
+    assert result["record"]["full_profile_approved"] is False
+    assert result["record"]["ready_for_final_renderer_binding"] is False
+    assert result["full_profile_approved"] is False
+    assert result["ready_for_final_renderer_binding"] is False
+
+    with connect(db_path) as conn:
+        after = conn.execute("SELECT COUNT(*) c FROM visual_design_specs WHERE production_plan_id = ?", (plan_id,)).fetchone()["c"]
+        prior_design_json_after = conn.execute("SELECT design_json FROM visual_design_specs WHERE id = ?", (prior_canonical_id,)).fetchone()["design_json"]
+    assert after == before + 1  # exactly one new append-only row
+    assert prior_design_json_after == prior_design_json_before  # prior canonical row byte-for-byte unchanged
+    assert result["prior_canonical_id"] == prior_canonical_id
+    assert result["record"]["corrects_record_id"] == prior_canonical_id
+
+    profile = json.loads(result["json_path"].read_text(encoding="utf-8"))
+    assert profile["category_approvals"]["font_family"]["resolution_status"] == "APPROVED"
+    assert profile["full_profile_approved"] is False
+    assert result["report_path"].exists()
+
+
+# PRIMARY typography is untouched by this stage
+def test_run_font_family_human_approval_does_not_change_typography(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, legacy_id, correction = _ready_plan_with_canonical_correction(tmp_path, db_path)
+    result = run_font_family_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    assert result["pass"] is True
+    assert CANDIDATES["CLEAN_DARK_FOCUS"]["roles"]["PRIMARY"] == "font-size:42px;font-weight:700;"
+    assert result["record"]["category_approvals"]["typography_scale"]["resolution_status"] == "PENDING_VISUAL_REVIEW"
+
+
+# CASE A: approving a font key that does not exist at all fails, writes nothing
+def test_run_font_family_human_approval_case_a_unknown_candidate_fails(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, legacy_id, correction = _ready_plan_with_canonical_correction(tmp_path, db_path)
+    with connect(db_path) as conn:
+        before = conn.execute("SELECT COUNT(*) c FROM visual_design_specs WHERE production_plan_id = ?", (plan_id,)).fetchone()["c"]
+    result = run_font_family_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id, approved_font_family="NOT_A_REAL_FONT")
+    assert result["pass"] is False
+    with connect(db_path) as conn:
+        after = conn.execute("SELECT COUNT(*) c FROM visual_design_specs WHERE production_plan_id = ?", (plan_id,)).fetchone()["c"]
+    assert after == before
+
+
+# CASE B: ARIAL_NEUTRAL has no recorded Human Review decision -- refused, writes nothing
+def test_run_font_family_human_approval_case_b_arial_without_human_review_fails(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, legacy_id, correction = _ready_plan_with_canonical_correction(tmp_path, db_path)
+    with connect(db_path) as conn:
+        before = conn.execute("SELECT COUNT(*) c FROM visual_design_specs WHERE production_plan_id = ?", (plan_id,)).fetchone()["c"]
+    result = run_font_family_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id, approved_font_family="ARIAL_NEUTRAL")
+    assert result["pass"] is False
+    assert "ARIAL_NEUTRAL" in result["reason"]
+    with connect(db_path) as conn:
+        after = conn.execute("SELECT COUNT(*) c FROM visual_design_specs WHERE production_plan_id = ?", (plan_id,)).fetchone()["c"]
+    assert after == before
+
+
+# CASE C: SEGOE_MODERN has no recorded Human Review decision -- refused, writes nothing
+def test_run_font_family_human_approval_case_c_segoe_without_human_review_fails(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, legacy_id, correction = _ready_plan_with_canonical_correction(tmp_path, db_path)
+    result = run_font_family_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id, approved_font_family="SEGOE_MODERN")
+    assert result["pass"] is False
+    assert "SEGOE_MODERN" in result["reason"]
+
+
+# CASE D (inverse, structural): typography_scale never becomes APPROVED as a side effect
+def test_run_font_family_human_approval_case_d_never_approves_typography_scale(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, legacy_id, correction = _ready_plan_with_canonical_correction(tmp_path, db_path)
+    result = run_font_family_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    assert result["record"]["category_approvals"]["typography_scale"]["resolution_status"] != "APPROVED"
+
+
+# CASE E (inverse, structural): PRIMARY's real code value never changes because of this approval
+def test_run_font_family_human_approval_case_e_primary_value_unchanged(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, legacy_id, correction = _ready_plan_with_canonical_correction(tmp_path, db_path)
+    before = CANDIDATES["CLEAN_DARK_FOCUS"]["roles"]["PRIMARY"]
+    run_font_family_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    assert CANDIDATES["CLEAN_DARK_FOCUS"]["roles"]["PRIMARY"] == before == "font-size:42px;font-weight:700;"
+
+
+# CASE F: full_profile_approved never becomes True from this single-category approval
+def test_run_font_family_human_approval_case_f_full_profile_stays_false(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, legacy_id, correction = _ready_plan_with_canonical_correction(tmp_path, db_path)
+    result = run_font_family_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    assert result["record"]["full_profile_approved"] is False
+
+
+# CASE G: ready_for_final_renderer_binding never becomes True (8 other mandatory categories still PENDING)
+def test_run_font_family_human_approval_case_g_renderer_gate_stays_false(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, legacy_id, correction = _ready_plan_with_canonical_correction(tmp_path, db_path)
+    result = run_font_family_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    assert result["record"]["ready_for_final_renderer_binding"] is False
+
+
+# CASE H: the existing canonical DB row is never overwritten -- append-only
+def test_run_font_family_human_approval_case_h_does_not_overwrite_canonical_row(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, legacy_id, correction = _ready_plan_with_canonical_correction(tmp_path, db_path)
+    prior_id = correction["visual_design_row_id"]
+    with connect(db_path) as conn:
+        before = conn.execute("SELECT design_json FROM visual_design_specs WHERE id = ?", (prior_id,)).fetchone()["design_json"]
+    run_font_family_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    with connect(db_path) as conn:
+        after = conn.execute("SELECT design_json FROM visual_design_specs WHERE id = ?", (prior_id,)).fetchone()["design_json"]
+    assert before == after
+
+
+# CASE I: the CLEAN_DARK_FOCUS canonical visual candidate is never changed by a font_family approval
+def test_run_font_family_human_approval_case_i_visual_candidate_unchanged(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, legacy_id, correction = _ready_plan_with_canonical_correction(tmp_path, db_path)
+    result = run_font_family_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    assert result["record"]["selected_candidate"] == "CLEAN_DARK_FOCUS"
+
+
+# fails cleanly with no canonical correction record yet (no correct-visual-approval run at all)
+def test_run_font_family_human_approval_fails_without_canonical_record(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir = _make_ready_plan_with_scene_layout(tmp_path, db_path)
+    run_visual_design(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    result = run_font_family_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    assert result["pass"] is False
+
+
+# the default approved_font_family constant is exactly VERDANA_HUMANIST -- the only candidate with a
+# real Human Review decision on record
+def test_human_reviewed_font_family_constant_is_verdana():
+    assert HUMAN_REVIEWED_FONT_FAMILY == "VERDANA_HUMANIST"
+
+
+# Font Review Prototype (font_review/) and existing Visual Prototype (prototypes/) are both untouched
+def test_run_font_family_human_approval_does_not_touch_prototype_directories(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, legacy_id, correction = _ready_plan_with_canonical_correction(tmp_path, db_path)
+    design_result = run_visual_design(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    review_result = run_font_family_review(db_path, assets_dir, reports_dir, plan_id=plan_id)
+
+    proto_manifest_before = (design_result["prototype_dir"] / "manifest.json").read_text(encoding="utf-8")
+    font_review_manifest_before = (review_result["review_dir"] / "manifest.json").read_text(encoding="utf-8")
+
+    run_font_family_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+
+    proto_manifest_after = (design_result["prototype_dir"] / "manifest.json").read_text(encoding="utf-8")
+    font_review_manifest_after = (review_result["review_dir"] / "manifest.json").read_text(encoding="utf-8")
+    assert proto_manifest_before == proto_manifest_after
+    assert font_review_manifest_before == font_review_manifest_after
