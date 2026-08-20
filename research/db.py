@@ -491,6 +491,45 @@ CREATE TABLE IF NOT EXISTS asset_generation_runs (
     retry_count INTEGER NOT NULL DEFAULT 0,
     report_json TEXT
 );
+
+CREATE TABLE IF NOT EXISTS render_specs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    production_plan_id INTEGER NOT NULL,
+    spec_version TEXT NOT NULL,
+    spec_json TEXT NOT NULL,
+    validation_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS render_timelines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    production_plan_id INTEGER NOT NULL,
+    render_spec_id INTEGER,
+    timeline_version TEXT NOT NULL,
+    timeline_json TEXT NOT NULL,
+    validation_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS scene_layouts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    production_plan_id INTEGER NOT NULL,
+    timeline_id INTEGER,
+    layout_version TEXT NOT NULL,
+    layout_json TEXT NOT NULL,
+    validation_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS visual_design_specs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    production_plan_id INTEGER NOT NULL,
+    scene_layout_id INTEGER,
+    visual_design_version TEXT NOT NULL,
+    design_json TEXT NOT NULL,
+    validation_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 

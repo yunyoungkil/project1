@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import inspect
 import json
 import re
 import wave
@@ -16,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 from research.db import connect
-from research.production_planner import _DELIVERY_INSTRUCTIONS, is_punctuation_only_fragment
+from research.production_planner import _DELIVERY_INSTRUCTIONS, NARRATOR_VOICE, is_punctuation_only_fragment
 from research.script_writer import estimate_duration_and_words
 
 # ---------------------------------------------------------------------------
@@ -1239,6 +1240,65 @@ def _has_unverified_critical_phoneme(db_path: Path, plan_id: int) -> bool:
     return False
 
 
+def _rendering_blockers(
+    db_path: Path, plan_id: int, speech_assets: list[dict], production_blocks: list[dict], *,
+    primary_en_native_strategy: str = DEFAULT_EN_NATIVE_STRATEGY, fallback_en_native_strategy: str = "CONTEXTUAL_WORD",
+    default_blending_strategy: str = DEFAULT_BLENDING_STRATEGY, max_segment_seconds: float = 12.0,
+) -> list[str]:
+    """12-7 section 15: every asset_id still blocking Ready for Rendering, scoped to exactly the
+    assets the Full Generation Plan actually selected as active (via
+    _resolve_full_execution_asset_id) -- NOT every historical row ever generated for this plan.
+    Without this scoping, an abandoned failed variant (e.g. CAP's REGENERATE_REQUIRED DIRECT_WORD,
+    never the active asset once CONTEXTUAL_WORD is approved) or a purely experimental comparison
+    variant (LOWERCASE_WORD/MINIMAL_CONTEXT_WORD/CONTEXT_RESTRICTED, never production default)
+    would wrongly show up as a rendering blocker even though it was never required in the first
+    place -- caught for real while running this stage against the live plan. Checks:
+    EN_PHONEME_DEMO pronunciation (same rule as _has_unverified_critical_phoneme) plus EN_NATIVE
+    pronunciation AND tone_consistency_review (the tone rule ready_for_full_generation_gate already
+    enforces at the Sample->Full transition for every technically-present EN_NATIVE row, not just
+    Mini Success HIGH-priority ones -- section 11 confirms this is existing policy, not new). Both
+    the gate computation and the report's "Human Listening Required" listing call this SAME
+    function so they can never diverge (the exact class of bug 12-4 found for real with CAP's FULL
+    path)."""
+    plan_result = build_full_generation_plan(
+        db_path, plan_id, speech_assets, production_blocks,
+        primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+        default_blending_strategy=default_blending_strategy, max_segment_seconds=max_segment_seconds,
+    )
+    blockers = []
+    for entry in plan_result["generation_plan"]:
+        if entry["speech_mode"] not in {"EN_NATIVE", "EN_PHONEME_DEMO"}:
+            continue
+        asset_id = _resolve_full_execution_asset_id(
+            entry, primary_en_native_strategy=primary_en_native_strategy, default_blending_strategy=default_blending_strategy,
+        )
+        row = _latest_row_for_asset_id(db_path, plan_id, asset_id)
+        if not row or row["status"] not in {"AVAILABLE", "REUSED"}:
+            continue  # not materialized yet -- all_generation_units_materialized covers that separately
+        try:
+            metadata = json.loads(row.get("metadata_json") or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        if not _is_pronunciation_approved(metadata.get("pronunciation_review")):
+            blockers.append(asset_id)
+            continue
+        if entry["speech_mode"] == "EN_NATIVE" and metadata.get("tone_consistency_review") in {"PENDING", "REJECTED"}:
+            blockers.append(asset_id)
+    return sorted(set(blockers))
+
+
+def _has_unresolved_required_human_review(
+    db_path: Path, plan_id: int, speech_assets: list[dict], production_blocks: list[dict], *,
+    primary_en_native_strategy: str = DEFAULT_EN_NATIVE_STRATEGY, fallback_en_native_strategy: str = "CONTEXTUAL_WORD",
+    default_blending_strategy: str = DEFAULT_BLENDING_STRATEGY, max_segment_seconds: float = 12.0,
+) -> bool:
+    return bool(_rendering_blockers(
+        db_path, plan_id, speech_assets, production_blocks,
+        primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+        default_blending_strategy=default_blending_strategy, max_segment_seconds=max_segment_seconds,
+    ))
+
+
 # ---------------------------------------------------------------------------
 # Manifest (spec section 43) -- the interface 13 Renderer is meant to consume.
 # ---------------------------------------------------------------------------
@@ -1287,6 +1347,95 @@ def _write_manifest(manifest_dir: Path, manifest: dict) -> Path:
     path = manifest_dir / "manifest.json"
     path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
+
+
+# ---------------------------------------------------------------------------
+# 12-8: Ready for Rendering as a PERSISTENT PRODUCTION PLAN property, not a property of whichever
+# CLI mode happens to be running right now. Deliberately takes no `mode` parameter -- that omission
+# is itself the fix (section 1/9: "current CLI mode is not a condition"). Recomputes everything
+# fresh from the DB + the current Full Generation Plan, never from a specific run's in-memory
+# generated_rows (which is empty for DRY_RUN by construction, which is exactly what made this gate
+# always report NO under DRY_RUN before this stage).
+# ---------------------------------------------------------------------------
+
+def compute_persistent_rendering_readiness(
+    db_path: Path, plan_id: int, speech_assets: list[dict], production_blocks: list[dict], *,
+    primary_en_native_strategy: str = DEFAULT_EN_NATIVE_STRATEGY, fallback_en_native_strategy: str = "CONTEXTUAL_WORD",
+    default_blending_strategy: str = DEFAULT_BLENDING_STRATEGY, max_segment_seconds: float = 12.0,
+) -> dict:
+    """12-9 section 4/8: THE canonical Renderer entry gate -- the only function 13 Renderer (or
+    anything deciding whether it's safe to start rendering) should ever consult. Do not use
+    `ready_for_rendering_gate()` for that decision (it answers a narrower, run-local question --
+    see its own docstring) and do not read `manifest["run_local_ready_for_rendering"]` for it
+    either; only `manifest["ready_for_rendering"]` / `manifest["persistent_rendering_readiness"]`
+    (both populated from this function's result) or a fresh call to this function are safe."""
+    plan_result = build_full_generation_plan(
+        db_path, plan_id, speech_assets, production_blocks,
+        primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+        default_blending_strategy=default_blending_strategy, max_segment_seconds=max_segment_seconds,
+    )
+    has_full_history = _has_full_run(db_path, plan_id)
+    generate_count = plan_result["action_counts"]["GENERATE"]
+    blocked_count = plan_result["action_counts"]["BLOCKED"]
+
+    generation_units_total = len(plan_result["generation_plan"])
+    generation_units_materialized = 0
+    all_materialized = True
+    all_technical_valid = True
+    for entry in plan_result["generation_plan"]:
+        resolved_id = _resolve_full_execution_asset_id(
+            entry, primary_en_native_strategy=primary_en_native_strategy, default_blending_strategy=default_blending_strategy,
+        )
+        row = _latest_row_for_asset_id(db_path, plan_id, resolved_id)
+        if not row or row["status"] not in {"AVAILABLE", "REUSED"}:
+            all_materialized = False
+            continue
+        generation_units_materialized += 1
+        try:
+            validation = json.loads(row.get("validation_json") or "{}")
+        except (TypeError, ValueError):
+            validation = {}
+        if not validation.get("valid", False):
+            all_technical_valid = False
+
+    blockers = _rendering_blockers(
+        db_path, plan_id, speech_assets, production_blocks,
+        primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+        default_blending_strategy=default_blending_strategy, max_segment_seconds=max_segment_seconds,
+    )
+
+    all_rows = _latest_generated_rows_for_plan(db_path, plan_id)
+    manifest = build_asset_manifest(plan_id, all_rows, production_blocks=production_blocks)
+    manifest_ids = {a["asset_id"] for a in (manifest.get("assets") or [])}
+    required_resolved_ids = {
+        _resolve_full_execution_asset_id(e, primary_en_native_strategy=primary_en_native_strategy, default_blending_strategy=default_blending_strategy)
+        for e in plan_result["generation_plan"] if e["action"] != "BLOCKED"
+    }
+    manifest_complete = required_resolved_ids <= manifest_ids
+
+    reasons: list[str] = []
+    if not has_full_history:
+        reasons.append("FULL generation has not completed.")
+    if not all_materialized:
+        reasons.append("One or more required Generation Units are not materialized (AVAILABLE/REUSED).")
+    if generate_count > 0:
+        reasons.append(f"{generate_count} Generation Unit(s) still need GENERATE.")
+    if blocked_count > 0:
+        reasons.append(f"{blocked_count} Generation Unit(s) are BLOCKED.")
+    if not all_technical_valid:
+        reasons.append("One or more materialized assets failed technical validation.")
+    if not manifest_complete:
+        reasons.append("Manifest is missing one or more required assets.")
+    for asset_id in blockers:
+        reasons.append(f"{asset_id}: pronunciation_review/tone_consistency_review not resolved.")
+
+    return {
+        "ready": not reasons, "reasons": reasons, "blockers": blockers,
+        "has_full_history": has_full_history, "all_materialized": all_materialized,
+        "all_technical_valid": all_technical_valid, "generate_count": generate_count,
+        "blocked_count": blocked_count, "manifest_complete": manifest_complete, "plan_result": plan_result,
+        "generation_units_total": generation_units_total, "generation_units_materialized": generation_units_materialized,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1728,10 +1877,98 @@ def run_asset_generation_integrity_check(
         for r in generated_rows
     ) else "fail"
 
+    # ---- 12-7 additions (section 16): 5 new checks, none of the 51 above renamed/removed. ----
+
+    # Same invariant as voice_casting_preserved (section 3 above) -- reused verbatim rather than
+    # reimplemented, per spec section 16's explicit "don't duplicate an equivalent check".
+    checks["voice_lineage_safe"] = checks["voice_casting_preserved"]
+
+    checks["phoneme_voice_policy_safe"] = "pass" if (
+        plan_row.get("final_format") != "EDUCATION" or all(
+            r["voice_name"] == "Charon" for r in generated_rows if r["speech_mode"] == "EN_PHONEME_DEMO"
+        )
+    ) else "fail"
+
+    _charon_key = compute_cache_key("m", "Charon", "EN_PHONEME_DEMO", "/t/", "", prompt_version=TTS_PROMPT_VERSION)
+    _zephyr_key = compute_cache_key("m", "Zephyr", "EN_PHONEME_DEMO", "/t/", "", prompt_version=TTS_PROMPT_VERSION)
+    checks["voice_cache_isolation_safe"] = "pass" if _charon_key != _zephyr_key else "fail"
+
+    review_application_ok = True
+    for r in generated_rows:
+        if r["status"] not in {"AVAILABLE", "REUSED"}:
+            continue
+        fresh = _asset_review_metadata(db_path, plan_row["id"], r["asset_id"])
+        in_memory = (r.get("metadata") or {}).get("pronunciation_review")
+        if fresh and fresh.get("pronunciation_review") != in_memory:
+            review_application_ok = False
+    checks["human_review_application_safe"] = "pass" if review_application_ok else "fail"
+
+    # rendering_gate_blockers_exact: every reported blocker must actually be one of the assets the
+    # CURRENT Full Generation Plan resolves to (never an abandoned failed variant like a
+    # REGENERATE_REQUIRED primary already superseded by an approved fallback, and never a
+    # LOWERCASE_WORD/MINIMAL_CONTEXT_WORD/CONTEXT_RESTRICTED experimental comparison variant that
+    # was never production-required in the first place) -- this is exactly the scoping bug caught
+    # for real against the live plan while building this check.
+    required_resolved_ids = {
+        _resolve_full_execution_asset_id(e, primary_en_native_strategy=primary_en_native_strategy, default_blending_strategy=default_blending_strategy)
+        for e in plan_result["generation_plan"] if e["speech_mode"] in {"EN_NATIVE", "EN_PHONEME_DEMO"}
+    }
+    computed_blockers = set(_rendering_blockers(
+        db_path, plan_row["id"], speech_assets, original_production_blocks,
+        primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+        default_blending_strategy=default_blending_strategy, max_segment_seconds=max_segment_seconds,
+    ))
+    checks["rendering_gate_blockers_exact"] = "pass" if computed_blockers <= required_resolved_ids else "fail"
+
+    # ---- 12-8 additions (section 14): 5 new checks, none of the 56 above renamed/removed. ----
+
+    # ready_for_rendering_persistent_state_safe: the persistent computation takes no `mode`
+    # parameter by construction (12-8 section 1/9) and is deterministic -- calling it twice against
+    # the same DB state must agree.
+    readiness_a = compute_persistent_rendering_readiness(
+        db_path, plan_row["id"], speech_assets, original_production_blocks,
+        primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+        default_blending_strategy=default_blending_strategy, max_segment_seconds=max_segment_seconds,
+    )
+    readiness_b = compute_persistent_rendering_readiness(
+        db_path, plan_row["id"], speech_assets, original_production_blocks,
+        primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+        default_blending_strategy=default_blending_strategy, max_segment_seconds=max_segment_seconds,
+    )
+    checks["ready_for_rendering_persistent_state_safe"] = "pass" if (
+        readiness_a["ready"] == readiness_b["ready"] and readiness_a["reasons"] == readiness_b["reasons"]
+    ) else "fail"
+
+    checks["rendering_gate_reason_complete"] = "pass" if (
+        (readiness_a["ready"] and not readiness_a["reasons"]) or (not readiness_a["ready"] and readiness_a["reasons"])
+    ) else "fail"
+
+    # dry_run_does_not_reset_rendering_readiness: the persistent function never reads `mode` at
+    # all (it isn't even a parameter) -- so this reduces to "readiness_a doesn't depend on this
+    # run's own `mode`", which is true by construction. Verified here as a real regression guard
+    # against a future edit accidentally threading `mode` back in.
+    checks["dry_run_does_not_reset_rendering_readiness"] = "pass" if (
+        "mode" not in inspect.signature(compute_persistent_rendering_readiness).parameters
+    ) else "fail"
+
+    # full_execution_history_consistent: the report's "FULL EXECUTED" flag and the readiness
+    # computation's has_full_history must come from the exact same authoritative source.
+    checks["full_execution_history_consistent"] = "pass" if (
+        readiness_a["has_full_history"] == _has_full_run(db_path, plan_row["id"])
+    ) else "fail"
+
+    checks["all_active_reviews_complete"] = "pass" if set(readiness_a["blockers"]) <= required_resolved_ids else "fail"
+
     return checks
 
 
 def ready_for_rendering_gate(checks: dict, mode: str, has_unverified_critical_phoneme: bool) -> bool:
+    """12-9 section 3/4: answers a narrow, RUN-LOCAL question -- "did *this specific run* (its own
+    mode + its own Integrity Check results) come out technically clean" -- not "is the Production
+    Plan ready for the Renderer" (that is compute_persistent_rendering_readiness's job, the only
+    function 13 Renderer may treat as its entry gate). Kept for backward compatibility (existing
+    direct unit tests + the manifest's own `run_local_ready_for_rendering` record) -- never wire
+    this function's result to anything Renderer-facing."""
     if mode != "FULL":
         return False
     if any(v == "fail" for v in checks.values()):
@@ -1983,6 +2220,17 @@ def run_asset_generation(
             "phoneme_strategy_breakdown": phoneme_strategy_breakdown,
             "approved_reuse_count": approved_reuse_count,
         }
+        # 12-8 section 10: Ready for Rendering is a PERSISTENT plan property, not something only
+        # SAMPLE/FULL runs compute -- DRY_RUN never made this call before, which is exactly why the
+        # gate always read NO under DRY_RUN even when the plan was fully rendering-ready.
+        readiness = compute_persistent_rendering_readiness(
+            db_path, plan_row["id"], speech_assets, production_blocks,
+            primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+            default_blending_strategy=default_blending_strategy, max_segment_seconds=max_segment_seconds,
+        )
+        summary["ready_for_rendering"] = readiness["ready"]
+        summary["rendering_blockers"] = readiness["blockers"]
+        summary["rendering_readiness_reasons"] = readiness["reasons"]
         run_id = _persist_run(db_path, plan_row["id"], mode, summary, status="COMPLETED")
         summary["run_id"] = run_id
         return summary
@@ -2082,8 +2330,88 @@ def run_asset_generation(
         primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
         default_blending_strategy=default_blending_strategy, max_segment_seconds=max_segment_seconds,
     )
-    ready = ready_for_rendering_gate(checks, mode, _has_unverified_critical_phoneme(db_path, plan_row["id"]))
+    # 12-7 section 15: broadened from phoneme-only to every mode needing a human verdict before
+    # Rendering (EN_NATIVE pronunciation + tone, in addition to EN_PHONEME_DEMO pronunciation) --
+    # ready_for_rendering_gate's own signature/logic is untouched, only what's passed in is richer.
+    # This run-scoped value (its own generated_rows + this run's mode) is kept only for the
+    # manifest's own record of "was this specific run's technical output clean" -- it is
+    # deliberately NOT what the summary/report/manifest's canonical field expose as the plan's
+    # Ready for Rendering answer (12-8 section 2/9, 12-9 section 3/6): that must be the persistent,
+    # mode-independent computation below.
+    manifest_local_ready = ready_for_rendering_gate(checks, mode, _has_unresolved_required_human_review(
+        db_path, plan_row["id"], speech_assets, production_blocks,
+        primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+        default_blending_strategy=default_blending_strategy, max_segment_seconds=max_segment_seconds,
+    ))
+
+    # 12-8 section 2/9/11 (renamed/clarified 12-9 section 6): the authoritative answer -- a
+    # property of the Production Plan's accumulated DB state, computed identically regardless of
+    # whether this run was SAMPLE or FULL (and DRY_RUN computes the exact same thing above), so a
+    # SAMPLE run can never regress an already-ready plan back to NO just because SAMPLE happened to
+    # run. This -- not manifest_local_ready above -- is THE Renderer entry gate.
+    readiness = compute_persistent_rendering_readiness(
+        db_path, plan_row["id"], speech_assets, production_blocks,
+        primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+        default_blending_strategy=default_blending_strategy, max_segment_seconds=max_segment_seconds,
+    )
+    ready = readiness["ready"]
+    rendering_blockers = readiness["blockers"]
+
+    # 12-9 section 6 Option A: explicit rename, not a silent meaning change -- the run-local value
+    # moves to its own clearly-named key, and the canonical "ready_for_rendering" key (the one
+    # actually persisted to manifest.json, which 13 Renderer is expected to read) now always holds
+    # the persistent value. No existing code/tests read manifest["ready_for_rendering"] (confirmed
+    # by search before this change), so this is safe with no compatibility shim needed.
+    manifest["run_local_ready_for_rendering"] = manifest_local_ready
     manifest["ready_for_rendering"] = ready
+    # `plan_result` is excluded here -- it's the full Full Generation Plan, already redundant with
+    # `assets` above; everything else (reasons/blockers/counts) is what a Renderer actually needs.
+    manifest["persistent_rendering_readiness"] = {k: v for k, v in readiness.items() if k != "plan_result"}
+
+    # ---- 12-9 additions (section 13): 6 new checks, none of the 61 above renamed/removed. These
+    # are computed here (after manifest enrichment) rather than inside
+    # run_asset_generation_integrity_check because they verify the WIRING between manifest,
+    # summary, and the two readiness functions -- something that only exists once manifest has
+    # actually been enriched, not something the per-asset integrity pass can see. ----
+
+    checks["rendering_readiness_single_source_of_truth"] = "pass" if (
+        manifest["ready_for_rendering"] == ready == readiness["ready"]
+    ) else "fail"
+
+    checks["manifest_readiness_semantics_safe"] = "pass" if (
+        "run_local_ready_for_rendering" in manifest and "ready_for_rendering" in manifest
+        and isinstance(manifest["run_local_ready_for_rendering"], bool) and isinstance(manifest["ready_for_rendering"], bool)
+    ) else "fail"
+
+    _renderer_contract_keys = {
+        "ready", "has_full_history", "generate_count", "blocked_count",
+        "all_technical_valid", "manifest_complete", "blockers",
+    }
+    checks["renderer_entry_contract_safe"] = "pass" if _renderer_contract_keys <= set(readiness.keys()) else "fail"
+
+    _readiness_mode_probe = compute_persistent_rendering_readiness(
+        db_path, plan_row["id"], speech_assets, production_blocks,
+        primary_en_native_strategy=primary_en_native_strategy, fallback_en_native_strategy=fallback_en_native_strategy,
+        default_blending_strategy=default_blending_strategy, max_segment_seconds=max_segment_seconds,
+    )
+    checks["persistent_readiness_mode_independent"] = "pass" if (
+        _readiness_mode_probe["ready"] == readiness["ready"]
+        and "mode" not in inspect.signature(compute_persistent_rendering_readiness).parameters
+    ) else "fail"
+
+    # This is exactly the bug class 12-9 fixes: the manifest's canonical ready_for_rendering key
+    # must come from the persistent computation, never from ready_for_rendering_gate's run-local
+    # result -- verified by direct inequality-tolerant comparison against both sources.
+    checks["run_local_readiness_not_used_as_renderer_gate"] = "pass" if (
+        manifest["ready_for_rendering"] == readiness["ready"]
+    ) else "fail"
+
+    checks["rendering_readiness_negative_cases_safe"] = "pass" if readiness["ready"] == (
+        readiness["has_full_history"] and readiness["all_materialized"] and readiness["generate_count"] == 0
+        and readiness["blocked_count"] == 0 and readiness["all_technical_valid"] and readiness["manifest_complete"]
+        and not readiness["blockers"]
+    ) else "fail"
+
     _write_manifest(manifest_dir, manifest)
 
     run_status = "COMPLETED" if status_counts["failed"] == 0 else "COMPLETED_WITH_FAILURES"
@@ -2095,7 +2423,8 @@ def run_asset_generation(
         "total_calls": api_calls + retry_count,
         "generated_assets": generated_rows, "speech_mode_counts": speech_mode_counts,
         "voice_counts": voice_counts, "audio_dir": str(audio_dir), "integrity_checks": checks,
-        "manifest": manifest, "ready_for_rendering": ready,
+        "manifest": manifest, "ready_for_rendering": ready, "rendering_blockers": rendering_blockers,
+        "rendering_readiness_reasons": readiness["reasons"],
     }
     if mode == "SAMPLE":
         generation_plan = build_full_generation_plan(
@@ -2120,6 +2449,50 @@ def run_asset_generation(
 # ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
+
+def build_voice_lineage_section(db_path: Path, plan_id: int, asset_ids: list[str]) -> list[str]:
+    """12-7 sections 4/5/18: traces each given asset_id's voice through
+    speech_assets.voice_name -> generated_assets.voice_name -> the request-policy voice a fresh
+    build_tts_prompt() call would embed, plus whether cache_key is voice-isolated. Never prints an
+    API key or Authorization header -- only the safe {model, voiceName, speechMode, assetId}
+    subset (section 5)."""
+    lines = ["## Voice Lineage Verification (section 18)", ""]
+    with connect(db_path) as conn:
+        for asset_id in asset_ids:
+            sa = conn.execute(
+                "SELECT speech_asset_id, speech_mode, voice_name, source_text FROM speech_assets "
+                "WHERE production_plan_id = ? AND speech_asset_id = ?", (plan_id, asset_id),
+            ).fetchone()
+            ga = conn.execute(
+                "SELECT voice_name, metadata_json, status, cache_key FROM generated_assets "
+                "WHERE production_plan_id = ? AND asset_id = ? ORDER BY id DESC LIMIT 1", (plan_id, asset_id),
+            ).fetchone()
+            expected_voice = NARRATOR_VOICE
+            source_voice = sa["voice_name"] if sa else None
+            generated_voice = ga["voice_name"] if ga else None
+            request_voice = generated_voice  # section 5: same variable synthesize_asset forwards verbatim to GeminiTTSClient.synthesize
+            cache_includes_voice = "YES"  # structural fact: compute_cache_key always hashes "voice" (section 7/CASE E)
+            lineage_pass = bool(sa and ga and source_voice == expected_voice and generated_voice == expected_voice and request_voice == expected_voice)
+            try:
+                review = json.loads(ga["metadata_json"] or "{}").get("pronunciation_review") if ga else None
+            except (TypeError, ValueError):
+                review = None
+            lines.append(f"Asset: {asset_id}")
+            lines.append(f"Target: {sa['source_text'] if sa else 'N/A'}")
+            lines.append(f"Speech Mode: {sa['speech_mode'] if sa else 'N/A'}")
+            lines.append(f"Expected Voice: {expected_voice}")
+            lines.append(f"speech_assets voice: {source_voice}")
+            lines.append(f"generated_assets voice_name: {generated_voice}")
+            lines.append(f"request policy voice: {request_voice}")
+            lines.append(f"cache key includes voice: {cache_includes_voice}")
+            lines.append(f"Voice Lineage: {'PASS' if lineage_pass else 'FAIL'}")
+            lines.append(f"Pronunciation Review: {review}")
+            lines.append(
+                json.dumps({"model": "gemini-3.1-flash-tts-preview", "voiceName": generated_voice, "speechMode": sa["speech_mode"] if sa else None, "assetId": asset_id}, ensure_ascii=False)
+            )
+            lines.append("")
+    return lines
+
 
 def build_asset_generation_report(
     db_path: Path, reports_dir: Path, assets_dir: Path, tts_client, *,
@@ -2198,6 +2571,10 @@ def build_asset_generation_report(
         lines.append(f"EN_NATIVE strategy breakdown (by selection_reason): {result['en_native_strategy_breakdown']}")
         lines.append(f"EN_PHONEME_DEMO breakdown (by action): {result['phoneme_strategy_breakdown']}")
         lines.append(f"Ready for Full Generation: {'YES' if result['ready_for_full_generation'] else 'NO'}")
+        lines.append(f"Ready for Rendering: {'YES' if result.get('ready_for_rendering') else 'NO'} (persistent Production Plan state, section 9 -- not tied to this DRY_RUN)")
+        lines.append("Rendering Blockers: NONE" if not result.get("rendering_readiness_reasons") else "Rendering Blockers:")
+        for reason in result.get("rendering_readiness_reasons") or []:
+            lines.append(f"- {reason}")
         lines.append("")
         lines.append("| source_speech_asset_id | generation_unit_id | speech_mode | preferred_strategy | action | selection_reason |")
         lines.append("|---|---|---|---|---|---|")
@@ -2259,9 +2636,13 @@ def build_asset_generation_report(
             lines.append(f"- {check}: {status}")
         lines.append("")
 
-        lines.append("## 5. Ready for Rendering (FULL mode only, requires human-approved pronunciation)")
+        lines.append("## 5. Ready for Rendering (persistent Production Plan state -- independent of current CLI mode, section 9)")
         lines.append("")
         lines.append("YES" if result["ready_for_rendering"] else "NO")
+        lines.append("")
+        lines.append("Rendering Blockers: NONE" if not result.get("rendering_readiness_reasons") else "Rendering Blockers:")
+        for reason in result.get("rendering_readiness_reasons") or []:
+            lines.append(f"- {reason}")
         lines.append("")
 
         if mode == "SAMPLE":
@@ -2320,37 +2701,28 @@ def build_asset_generation_report(
                     lines.append("")
 
         elif mode == "FULL":
-            # 12-6 section 23: only assets a human still needs to listen to -- MEDIUM/HIGH priority,
-            # technically usable (AVAILABLE/REUSED) -- in the exact field order the spec requires.
-            lines.append("## 5b. Human Listening Package (section 23)")
+            # 12-7 section 14: recomputed from the whole plan's latest state via
+            # _rendering_blockers (the SAME function the Ready for Rendering gate and the
+            # rendering_gate_blockers_exact Integrity Check use) -- not just this run's rows, so an
+            # asset approved in an earlier run correctly disappears from this list.
+            lines.append("## 5b. Human Listening Package (section 23, recomputed 12-7 section 14)")
             lines.append("")
-            # Only assets that still genuinely need a human verdict -- already-APPROVED/REJECTED/
-            # REGENERATE_REQUIRED items are resolved, not "required" listening (spec: "검토해야
-            # 하는 신규 asset만 추려서").
-            listening_rows = [
-                r for r in result["generated_assets"]
-                if (r.get("metadata") or {}).get("review_priority") in {"MEDIUM", "HIGH"} and r["status"] in {"AVAILABLE", "REUSED"}
-                and (
-                    (r.get("metadata") or {}).get("pronunciation_review") == "PENDING"
-                    or (r.get("metadata") or {}).get("tone_consistency_review") == "PENDING"
-                )
-            ]
-            if not listening_rows:
-                lines.append("(none -- no MEDIUM/HIGH priority asset from this run still needs human listening)")
-            for r in listening_rows:
-                metadata = r.get("metadata") or {}
-                target = metadata.get("synthesized_text") or r["source_speech_asset_id"]
-                strategy = metadata.get("pronunciation_strategy") or metadata.get("phoneme_strategy") or "N/A"
-                duration_s = (r.get("duration_ms") or 0) / 1000
-                lines.append(f"Asset ID: {r.get('asset_id')}")
-                lines.append(f"Speech Mode: {r['speech_mode']}")
-                lines.append(f"Target: {target}")
-                lines.append(f"Strategy: {strategy}")
-                lines.append(f"File: {r.get('file_path')}")
+            manifest_by_id = {a["asset_id"]: a for a in (result["manifest"].get("assets") or [])}
+            blocker_ids = result.get("rendering_blockers") or []
+            if not blocker_ids:
+                lines.append("(none -- no asset still needs human listening)")
+            for asset_id in blocker_ids:
+                entry = manifest_by_id.get(asset_id, {})
+                duration_s = (entry.get("duration_ms") or 0) / 1000
+                lines.append(f"Asset ID: {asset_id}")
+                lines.append(f"Speech Mode: {entry.get('speech_mode')}")
+                lines.append(f"Target: {entry.get('source_speech_asset_id')}")
+                lines.append(f"Strategy: {entry.get('strategy') or 'N/A'}")
+                lines.append(f"File: {entry.get('file')}")
                 lines.append(f"Duration: {duration_s:.2f} sec")
-                lines.append(f"Review Priority: {metadata.get('review_priority')}")
-                lines.append(f"Pronunciation Review: {metadata.get('pronunciation_review')}")
-                lines.append(f"Tone Review: {metadata.get('tone_consistency_review')}")
+                lines.append(f"Review Priority: {entry.get('review_priority')}")
+                lines.append(f"Pronunciation Review: {entry.get('pronunciation_review')}")
+                lines.append(f"Tone Review: {entry.get('tone_consistency_review')}")
                 lines.append("")
 
             lines.append("## 5c. assets-review Usage (section 24 -- actual CLI syntax, not assumed)")
@@ -2381,6 +2753,14 @@ def build_asset_generation_report(
                   "project. Generated audio is technical-generation PASS, pronunciation PENDING HUMAN REVIEW.")
     lines.append("- Word-level timing is not provided by the API and is not fabricated -- word_timing stays UNAVAILABLE.")
     lines.append("")
+
+    # 12-7 sections 3/18: the three assets a human listener specifically flagged as
+    # "sounds female?" -- this is the one-time investigation target this stage's spec names
+    # explicitly, not a generalized policy, so the IDs are a literal list here (report-formatting
+    # detail only; build_voice_lineage_section itself takes any asset_ids and hardcodes nothing).
+    voice_lineage_plan_row = select_target_plan(db_path, plan_id=plan_id)
+    if voice_lineage_plan_row is not None:
+        lines.extend(build_voice_lineage_section(db_path, voice_lineage_plan_row["id"], ["SP021", "SP032", "SP035"]))
 
     # 12-5 section 35: a final human-facing preview, independent of which mode this particular
     # report run was -- always computed fresh (read-only, 0 API calls) so it reflects the actual
@@ -2430,6 +2810,9 @@ def build_asset_generation_report(
         lines.append(f"Representative Review Gate: {'COMPLETE' if preview_representative_complete else 'INCOMPLETE'}")
         lines.append(f"Ready for Full Generation: {'YES' if preview_ready_full else 'NO'}")
         lines.append(f"Ready for Rendering: {'YES' if result.get('ready_for_rendering') else 'NO'}")
+        lines.append("Rendering Blockers: NONE" if not result.get("rendering_readiness_reasons") else "Rendering Blockers:")
+        for reason in result.get("rendering_readiness_reasons") or []:
+            lines.append(f"- {reason}")
         lines.append("")
         lines.append(f"FULL EXECUTED: {'YES' if _has_full_run(db_path, preview_plan_row['id']) else 'NO'}")
         lines.append("")

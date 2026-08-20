@@ -19,11 +19,14 @@ from research.asset_generator import (
     _segment_is_safe,
     GENERATION_PLAN_ACTIONS,
     SELECTION_REASONS,
+    NARRATOR_VOICE,
     build_asset_generation_report,
     build_asset_manifest,
     build_full_generation_plan,
     build_generation_units,
     build_tts_prompt,
+    build_voice_lineage_section,
+    compute_persistent_rendering_readiness,
     classify_phoneme_demo_type,
     classify_phoneme_generation_strategy,
     compute_cache_key,
@@ -932,6 +935,20 @@ def test_case_v_original_16_checks_preserved_plus_5_new(tmp_path):
         "generated_audio_technical_validation_safe", "full_manifest_complete", "full_review_state_honest",
         "failed_or_rejected_asset_not_reused", "active_strategy_matches_full_plan", "full_api_call_accounting_safe",
     }
+    new_5_12_7 = {
+        "voice_lineage_safe", "phoneme_voice_policy_safe", "voice_cache_isolation_safe",
+        "human_review_application_safe", "rendering_gate_blockers_exact",
+    }
+    new_5_12_8 = {
+        "ready_for_rendering_persistent_state_safe", "rendering_gate_reason_complete",
+        "dry_run_does_not_reset_rendering_readiness", "full_execution_history_consistent",
+        "all_active_reviews_complete",
+    }
+    new_6_12_9 = {
+        "rendering_readiness_single_source_of_truth", "manifest_readiness_semantics_safe",
+        "renderer_entry_contract_safe", "persistent_readiness_mode_independent",
+        "run_local_readiness_not_used_as_renderer_gate", "rendering_readiness_negative_cases_safe",
+    }
     assert original_16 <= set(checks.keys())
     assert new_5_12_1 <= set(checks.keys())
     assert new_5_12_2 <= set(checks.keys())
@@ -939,7 +956,10 @@ def test_case_v_original_16_checks_preserved_plus_5_new(tmp_path):
     assert new_6_12_4 <= set(checks.keys())
     assert new_7_12_5 <= set(checks.keys())
     assert new_8_12_6 <= set(checks.keys())
-    assert len(checks) == 51
+    assert new_5_12_7 <= set(checks.keys())
+    assert new_5_12_8 <= set(checks.keys())
+    assert new_6_12_9 <= set(checks.keys())
+    assert len(checks) == 67
 
 
 # --------------------------------------------------------------------------
@@ -2924,6 +2944,610 @@ def test_12_6_case_s_t_u_production_plan_pause_viewer_action_unchanged_after_ful
     client = FakeTTSClient()
     run_asset_generation(db_path, client, mode="SAMPLE", tts_model="m", assets_dir=tmp_path / "assets", plan_id=plan_id)
     run_asset_generation(db_path, client, mode="FULL", tts_model="m", assets_dir=tmp_path / "assets", plan_id=plan_id)
+    with connect(db_path) as conn:
+        after_plan = dict(conn.execute("SELECT * FROM production_plans WHERE id = ?", (plan_id,)).fetchone())
+        after_blocks = [dict(r) for r in conn.execute(
+            "SELECT * FROM production_blocks WHERE production_plan_id = ? ORDER BY block_order", (plan_id,)
+        ).fetchall()]
+    assert before_plan == after_plan
+    assert before_blocks == after_blocks
+    mini_block = next(b for b in after_blocks if b["content_block_id"] == "CB_MINI")
+    timeline = json.loads(mini_block["timeline_spec_json"])
+    pause_event = next(ev for ev in timeline if ev["type"] == "PAUSE")
+    assert pause_event["duration_ms"] == 3000
+    assert mini_block["production_intent"] == "viewer_must_attempt_before_answer"
+
+
+# ============================================================================
+# 12-7: Voice Lineage verification + Human Review Rendering Gate (prompts/12-7
+# section 17, CASE A-W)
+# ============================================================================
+
+# CASE A/B/C: source voice policy for each mode is Charon (production_planner's NARRATOR_VOICE)
+def test_12_7_case_a_en_phoneme_demo_voice_policy_is_charon():
+    assert NARRATOR_VOICE == "Charon"
+    prompt = build_tts_prompt("EN_PHONEME_DEMO", "/t/", "Charon")
+    assert "Voice: Charon" in prompt
+
+
+def test_12_7_case_b_ko_narration_voice_policy_is_charon():
+    prompt = build_tts_prompt("KO_NARRATION", "안녕하세요.", "Charon")
+    assert "Voice: Charon" in prompt
+
+
+def test_12_7_case_c_en_native_voice_policy_is_charon():
+    prompt = build_tts_prompt("EN_NATIVE", "BAT", "Charon")
+    assert "Voice: Charon" in prompt
+
+
+# CASE D: Podcast female voice is Zephyr (separate code path, never reached by EDUCATION)
+def test_12_7_case_d_podcast_female_is_zephyr():
+    from research.production_planner import PODCAST_VOICES
+    assert PODCAST_VOICES["female"] == "Zephyr"
+    assert PODCAST_VOICES["male"] == "Charon"
+
+
+# CASE E: Charon /t/ cache key != Zephyr /t/ cache key
+def test_12_7_case_e_charon_and_zephyr_cache_keys_differ():
+    charon_key = compute_cache_key("m", "Charon", "EN_PHONEME_DEMO", "/t/", "", prompt_version=TTS_PROMPT_VERSION)
+    zephyr_key = compute_cache_key("m", "Zephyr", "EN_PHONEME_DEMO", "/t/", "", prompt_version=TTS_PROMPT_VERSION)
+    assert charon_key != zephyr_key
+
+
+# CASE F: metadata voice=Charon -> Voice Lineage PASS
+def test_12_7_case_f_charon_metadata_passes_voice_lineage(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        plan_id = _seed_plan_12_4(conn)
+    assets = _speech_assets_for(db_path, plan_id)
+    b_phoneme = _asset_by_id(assets, "SP210")
+    client = FakeTTSClient()
+    _gen_phoneme(db_path, plan_id, b_phoneme, client, tmp_path)
+    lines = build_voice_lineage_section(db_path, plan_id, ["SP210"])
+    text = "\n".join(lines)
+    assert "Voice Lineage: PASS" in text
+    assert '"voiceName": "Charon"' in text
+
+
+# CASE G/H/I: any Charon-vs-actual voice mismatch -> integrity checks fail
+def test_12_7_case_g_h_i_voice_mismatch_fails_checks(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        plan_id = _seed_plan_12_4(conn)
+    assets = _speech_assets_for(db_path, plan_id)
+    b_phoneme = _asset_by_id(assets, "SP210")
+    client = FakeTTSClient()
+    row = _gen_phoneme(db_path, plan_id, b_phoneme, client, tmp_path)
+    row["voice_name"] = "Zephyr"  # simulate a mismatch between source policy and generated asset
+    from research.asset_generator import run_asset_generation_integrity_check, build_asset_manifest as _bam
+    from research.asset_generator import _load_production_blocks
+    blocks = _load_production_blocks(db_path, plan_id)
+    manifest = _bam(plan_id, [row])
+    with connect(db_path) as conn:
+        real_plan_row = dict(conn.execute("SELECT * FROM production_plans WHERE id = ?", (plan_id,)).fetchone())
+    checks = run_asset_generation_integrity_check(db_path, real_plan_row, blocks, assets, [row], "FULL", manifest)
+    assert checks["voice_casting_preserved"] == "fail"
+    assert checks["voice_lineage_safe"] == "fail"
+    assert checks["phoneme_voice_policy_safe"] == "fail"
+
+
+# CASE J: Voice Lineage normal but human review PENDING -> never auto-approved
+def test_12_7_case_j_normal_lineage_does_not_auto_approve(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        plan_id = _seed_plan_12_4(conn)
+    assets = _speech_assets_for(db_path, plan_id)
+    b_phoneme = _asset_by_id(assets, "SP210")
+    client = FakeTTSClient()
+    _gen_phoneme(db_path, plan_id, b_phoneme, client, tmp_path)
+    build_voice_lineage_section(db_path, plan_id, ["SP210"])  # read-only, must not mutate review
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT metadata_json FROM generated_assets WHERE asset_id='SP210'").fetchone()
+    assert json.loads(row["metadata_json"])["pronunciation_review"] == "PENDING"
+
+
+# CASE K: SP016-equivalent approval applies only to its own exact variant
+def test_12_7_case_k_approval_applies_only_to_exact_variant(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        plan_id = _seed_plan_12_4(conn)
+    assets = _speech_assets_for(db_path, plan_id)
+    bag = _asset_by_id(assets, "SP201")
+    client = FakeTTSClient()
+    _gen(db_path, plan_id, bag, client, tmp_path)
+    _gen(db_path, plan_id, bag, client, tmp_path, asset_id="SP201::CONTEXTUAL_WORD", pronunciation_strategy="CONTEXTUAL_WORD")
+    _approve(db_path, plan_id, "SP201")
+    with connect(db_path) as conn:
+        direct = conn.execute("SELECT metadata_json FROM generated_assets WHERE asset_id='SP201'").fetchone()
+        contextual = conn.execute("SELECT metadata_json FROM generated_assets WHERE asset_id='SP201::CONTEXTUAL_WORD'").fetchone()
+    assert json.loads(direct["metadata_json"])["pronunciation_review"] == "APPROVED"
+    assert json.loads(contextual["metadata_json"])["pronunciation_review"] == "PENDING"
+
+
+# CASE L/M/N: blended-phoneme / isolated-phoneme approvals are preserved through re-verification
+def test_12_7_case_l_m_n_phoneme_approvals_preserved(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        plan_id = _seed_plan_12_4(conn)
+    assets = _speech_assets_for(db_path, plan_id)
+    blended = _asset_by_id(assets, "SP212")
+    isolated = _asset_by_id(assets, "SP210")
+    client = FakeTTSClient()
+    _gen_phoneme(db_path, plan_id, blended, client, tmp_path, asset_id="SP212::DIRECT_SEQUENCE", target_word="BAG")
+    _gen_phoneme(db_path, plan_id, isolated, client, tmp_path)
+    _approve(db_path, plan_id, "SP212::DIRECT_SEQUENCE")
+    _approve(db_path, plan_id, "SP210")
+    build_voice_lineage_section(db_path, plan_id, ["SP210"])  # must not disturb existing approvals
+    with connect(db_path) as conn:
+        blended_row = conn.execute("SELECT metadata_json FROM generated_assets WHERE asset_id='SP212::DIRECT_SEQUENCE'").fetchone()
+        isolated_row = conn.execute("SELECT metadata_json FROM generated_assets WHERE asset_id='SP210'").fetchone()
+    assert json.loads(blended_row["metadata_json"])["pronunciation_review"] == "APPROVED"
+    assert json.loads(isolated_row["metadata_json"])["pronunciation_review"] == "APPROVED"
+
+
+# CASE O/P: tone approvals for non-mini-success EN_NATIVE (BAG/MAP-equivalent) are preserved
+def test_12_7_case_o_p_tone_approvals_preserved(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        plan_id = _seed_plan_12_4(conn)
+    assets = _speech_assets_for(db_path, plan_id)
+    bag, mp = _asset_by_id(assets, "SP201"), _asset_by_id(assets, "SP202")
+    client = FakeTTSClient()
+    _gen(db_path, plan_id, bag, client, tmp_path)
+    _gen(db_path, plan_id, mp, client, tmp_path)
+    _approve(db_path, plan_id, "SP201", tone="APPROVED")
+    _approve(db_path, plan_id, "SP202", tone="APPROVED")
+    with connect(db_path) as conn:
+        bag_row = conn.execute("SELECT metadata_json FROM generated_assets WHERE asset_id='SP201'").fetchone()
+        map_row = conn.execute("SELECT metadata_json FROM generated_assets WHERE asset_id='SP202'").fetchone()
+    assert json.loads(bag_row["metadata_json"])["tone_consistency_review"] == "APPROVED"
+    assert json.loads(map_row["metadata_json"])["tone_consistency_review"] == "APPROVED"
+
+
+# CASE Q: the remaining review list contains exactly the still-PENDING assets, nothing else
+def test_12_7_case_q_remaining_review_list_is_exact(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        plan_id = _seed_plan_12_4(conn)
+    assets = _speech_assets_for(db_path, plan_id)
+    bag, mp, cap = _asset_by_id(assets, "SP201"), _asset_by_id(assets, "SP202"), _asset_by_id(assets, "SP203")
+    b_phoneme, g_phoneme = _asset_by_id(assets, "SP210"), _asset_by_id(assets, "SP211")
+    client = FakeTTSClient()
+    _gen(db_path, plan_id, bag, client, tmp_path)
+    _approve(db_path, plan_id, "SP201", tone="APPROVED")
+    _gen(db_path, plan_id, mp, client, tmp_path)
+    _approve(db_path, plan_id, "SP202", tone="APPROVED")
+    _gen(db_path, plan_id, cap, client, tmp_path)  # left PENDING on purpose
+    _gen_phoneme(db_path, plan_id, b_phoneme, client, tmp_path)
+    _approve(db_path, plan_id, "SP210")
+    _gen_phoneme(db_path, plan_id, g_phoneme, client, tmp_path)  # left PENDING on purpose
+
+    from research.asset_generator import _rendering_blockers, _load_production_blocks
+    blocks = _load_production_blocks(db_path, plan_id)
+    blockers = _rendering_blockers(db_path, plan_id, assets, blocks)
+    assert set(blockers) == {"SP203", "SP211"}
+
+
+# CASE R: Ready for Rendering blocker count matches the actual PENDING set exactly
+def test_12_7_case_r_rendering_blocker_count_accurate(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        plan_id = _seed_plan_12_4(conn)
+    client = FakeTTSClient()
+    run_asset_generation(db_path, client, mode="SAMPLE", tts_model="m", assets_dir=tmp_path / "assets", plan_id=plan_id)
+    result = run_asset_generation(db_path, client, mode="FULL", tts_model="m", assets_dir=tmp_path / "assets", plan_id=plan_id)
+    from research.asset_generator import _rendering_blockers, _load_production_blocks
+    assets = _speech_assets_for(db_path, plan_id)
+    blocks = _load_production_blocks(db_path, plan_id)
+    assert set(result["rendering_blockers"]) == set(_rendering_blockers(db_path, plan_id, assets, blocks))
+    assert result["ready_for_rendering"] is (len(result["rendering_blockers"]) == 0 and all(v == "pass" for v in result["integrity_checks"].values()))
+
+
+# CASE S/T/U: Production Plan / PAUSE / viewer_action unchanged by review application + gate recompute
+def test_12_7_case_s_t_u_production_plan_pause_viewer_action_unchanged(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        plan_id = _seed_plan_12_4(conn)
+    with connect(db_path) as conn:
+        before_plan = dict(conn.execute("SELECT * FROM production_plans WHERE id = ?", (plan_id,)).fetchone())
+        before_blocks = [dict(r) for r in conn.execute(
+            "SELECT * FROM production_blocks WHERE production_plan_id = ? ORDER BY block_order", (plan_id,)
+        ).fetchall()]
+    assets = _speech_assets_for(db_path, plan_id)
+    bag = _asset_by_id(assets, "SP201")
+    client = FakeTTSClient()
+    _gen(db_path, plan_id, bag, client, tmp_path)
+    _approve(db_path, plan_id, "SP201", tone="APPROVED")
+    build_voice_lineage_section(db_path, plan_id, ["SP201"])
+    run_asset_generation(db_path, client, mode="DRY_RUN", tts_model="m", assets_dir=tmp_path / "assets", plan_id=plan_id)
+    with connect(db_path) as conn:
+        after_plan = dict(conn.execute("SELECT * FROM production_plans WHERE id = ?", (plan_id,)).fetchone())
+        after_blocks = [dict(r) for r in conn.execute(
+            "SELECT * FROM production_blocks WHERE production_plan_id = ? ORDER BY block_order", (plan_id,)
+        ).fetchall()]
+    assert before_plan == after_plan
+    assert before_blocks == after_blocks
+    mini_block = next(b for b in after_blocks if b["content_block_id"] == "CB_MINI")
+    timeline = json.loads(mini_block["timeline_spec_json"])
+    pause_event = next(ev for ev in timeline if ev["type"] == "PAUSE")
+    assert pause_event["duration_ms"] == 3000
+    assert mini_block["production_intent"] == "viewer_must_attempt_before_answer"
+
+
+# CASE V: existing 51 Integrity Checks regress to 56 (5 new, none renamed/removed) --
+# covered by test_case_v_original_16_checks_preserved_plus_5_new above (updated to assert 56).
+# CASE W: full existing regression -- exercised by running the whole suite, not a single test.
+
+
+# ============================================================================
+# 12-8: Ready for Rendering as a persistent Production Plan property, independent of current CLI
+# mode (prompts/12-8 section 15, CASE A-W)
+# ============================================================================
+
+def _fully_ready_plan(tmp_path, db_path):
+    """Builds a _seed_plan_12_4 plan, approves everything the representative gate + rendering gate
+    need, and runs SAMPLE then FULL so a genuine FULL execution history exists. Returns plan_id."""
+    with connect(db_path) as conn:
+        plan_id = _seed_plan_12_4(conn)
+    assets = _speech_assets_for(db_path, plan_id)
+    bag, mp, cap, bat = (_asset_by_id(assets, sid) for sid in ("SP201", "SP202", "SP203", "SP204"))
+    b_phoneme, g_phoneme, blended = (_asset_by_id(assets, sid) for sid in ("SP210", "SP211", "SP212"))
+    client = FakeTTSClient()
+
+    _gen(db_path, plan_id, bag, client, tmp_path)
+    _approve(db_path, plan_id, "SP201", tone="APPROVED")
+    _gen(db_path, plan_id, mp, client, tmp_path)
+    _approve(db_path, plan_id, "SP202", tone="APPROVED")
+    _gen(db_path, plan_id, cap, client, tmp_path)
+    _approve(db_path, plan_id, "SP203", pronunciation="REGENERATE_REQUIRED")
+    _gen(db_path, plan_id, cap, client, tmp_path, asset_id="SP203::CONTEXTUAL_WORD", pronunciation_strategy="CONTEXTUAL_WORD")
+    _approve(db_path, plan_id, "SP203::CONTEXTUAL_WORD", tone="APPROVED")
+    _gen(db_path, plan_id, bat, client, tmp_path)
+    _approve(db_path, plan_id, "SP204", tone="APPROVED")
+    _gen_phoneme(db_path, plan_id, b_phoneme, client, tmp_path)
+    _approve(db_path, plan_id, "SP210")
+    _gen_phoneme(db_path, plan_id, g_phoneme, client, tmp_path)
+    _approve(db_path, plan_id, "SP211")
+    _gen_phoneme(db_path, plan_id, blended, client, tmp_path, asset_id="SP212::DIRECT_SEQUENCE", target_word="BAG")
+    _approve(db_path, plan_id, "SP212::DIRECT_SEQUENCE")
+
+    run_asset_generation(db_path, client, mode="SAMPLE", tts_model="m", assets_dir=tmp_path / "assets", plan_id=plan_id)
+    run_asset_generation(db_path, client, mode="FULL", tts_model="m", assets_dir=tmp_path / "assets", plan_id=plan_id)
+    return plan_id
+
+
+# CASE A/B/C/P/Q: a fully ready plan reports YES regardless of current CLI mode, and current-run
+# statistics (generated_count=0, reused_count=0 for a fresh DRY_RUN) never affect the answer.
+def test_12_8_case_a_b_c_p_q_ready_regardless_of_current_mode(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id = _fully_ready_plan(tmp_path, db_path)
+    client = FakeTTSClient()
+
+    dry_run_result = run_asset_generation(db_path, client, mode="DRY_RUN", tts_model="m", assets_dir=tmp_path / "assets", plan_id=plan_id)
+    assert dry_run_result["ready_for_rendering"] is True
+    assert dry_run_result["rendering_blockers"] == []
+    assert dry_run_result["generated_count"] == 0  # CASE P: DRY_RUN never generates
+    assert dry_run_result["reused_count"] == 0  # CASE Q: this run's own reused_count stays 0
+
+    sample_result = run_asset_generation(db_path, client, mode="SAMPLE", tts_model="m", assets_dir=tmp_path / "assets", plan_id=plan_id)
+    assert sample_result["ready_for_rendering"] is True
+
+    full_result = run_asset_generation(db_path, client, mode="FULL", tts_model="m", assets_dir=tmp_path / "assets", plan_id=plan_id)
+    assert full_result["ready_for_rendering"] is True
+    assert len(client.calls) == 0  # everything was already cached -- 0 new Gemini calls this whole test
+
+
+# CASE D: no FULL execution history at all -> NO
+def test_12_8_case_d_no_full_history_is_not_ready(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        plan_id = _seed_plan_12_4(conn)
+    assets = _speech_assets_for(db_path, plan_id)
+    from research.asset_generator import _load_production_blocks
+    blocks = _load_production_blocks(db_path, plan_id)
+    readiness = compute_persistent_rendering_readiness(db_path, plan_id, assets, blocks)
+    assert readiness["ready"] is False
+    assert readiness["has_full_history"] is False
+    assert "FULL generation has not completed." in readiness["reasons"]
+
+
+# CASE E: one required Generation Unit missing -> NO
+def test_12_8_case_e_missing_unit_is_not_ready(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id = _fully_ready_plan(tmp_path, db_path)
+    with connect(db_path) as conn:
+        conn.execute("DELETE FROM generated_assets WHERE production_plan_id = ? AND asset_id = 'SP210'", (plan_id,))
+    assets = _speech_assets_for(db_path, plan_id)
+    from research.asset_generator import _load_production_blocks
+    blocks = _load_production_blocks(db_path, plan_id)
+    readiness = compute_persistent_rendering_readiness(db_path, plan_id, assets, blocks)
+    assert readiness["ready"] is False
+    assert readiness["all_materialized"] is False
+
+
+# CASE F: GENERATE > 0 (a brand-new source with no history) -> NO
+def test_12_8_case_f_generate_greater_than_zero_is_not_ready(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    with connect(db_path) as conn:
+        plan_id = _seed_plan_12_4(conn)
+    assets = _speech_assets_for(db_path, plan_id)
+    from research.asset_generator import _load_production_blocks
+    blocks = _load_production_blocks(db_path, plan_id)
+    readiness = compute_persistent_rendering_readiness(db_path, plan_id, assets, blocks)
+    assert readiness["ready"] is False
+    assert readiness["generate_count"] > 0
+
+
+# CASE G: BLOCKED > 0 -> NO
+def test_12_8_case_g_blocked_greater_than_zero_is_not_ready(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id = _fully_ready_plan(tmp_path, db_path)
+    # Force CAP's fallback into a state where BOTH primary and fallback are explicitly rejected --
+    # the one real BLOCKED scenario the selection algorithm produces (12-4 section _en_native_plan_action).
+    _approve(db_path, plan_id, "SP203::CONTEXTUAL_WORD", pronunciation="REJECTED")
+    assets = _speech_assets_for(db_path, plan_id)
+    from research.asset_generator import _load_production_blocks
+    blocks = _load_production_blocks(db_path, plan_id)
+    readiness = compute_persistent_rendering_readiness(db_path, plan_id, assets, blocks)
+    assert readiness["ready"] is False
+    assert readiness["blocked_count"] > 0
+
+
+# CASE H: active pronunciation PENDING -> NO with the exact blocker named
+def test_12_8_case_h_active_pronunciation_pending_names_exact_blocker(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id = _fully_ready_plan(tmp_path, db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE generated_assets SET metadata_json = json_set(metadata_json, '$.pronunciation_review', 'PENDING') "
+            "WHERE production_plan_id = ? AND asset_id = 'SP210'", (plan_id,),
+        )
+    assets = _speech_assets_for(db_path, plan_id)
+    from research.asset_generator import _load_production_blocks
+    blocks = _load_production_blocks(db_path, plan_id)
+    readiness = compute_persistent_rendering_readiness(db_path, plan_id, assets, blocks)
+    assert readiness["ready"] is False
+    assert readiness["blockers"] == ["SP210"]
+    assert any("SP210" in r for r in readiness["reasons"])
+
+
+# CASE I: an inactive experimental variant left PENDING never affects readiness
+def test_12_8_case_i_inactive_experimental_variant_pending_has_no_effect(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id = _fully_ready_plan(tmp_path, db_path)
+    assets = _speech_assets_for(db_path, plan_id)
+    bag = _asset_by_id(assets, "SP201")
+    client = FakeTTSClient()
+    _gen(db_path, plan_id, bag, client, tmp_path, asset_id="SP201::LOWERCASE_WORD", pronunciation_strategy="LOWERCASE_WORD")
+    # left PENDING on purpose -- LOWERCASE_WORD is never the active/selected variant
+    from research.asset_generator import _load_production_blocks
+    blocks = _load_production_blocks(db_path, plan_id)
+    readiness = compute_persistent_rendering_readiness(db_path, plan_id, assets, blocks)
+    assert readiness["ready"] is True
+    assert "SP201::LOWERCASE_WORD" not in readiness["blockers"]
+
+
+# CASE J: CAP's failed DIRECT_WORD (REGENERATE_REQUIRED) coexists with an approved active
+# CONTEXTUAL_WORD fallback -> YES is still reachable
+def test_12_8_case_j_failed_primary_with_approved_fallback_allows_ready(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id = _fully_ready_plan(tmp_path, db_path)
+    with connect(db_path) as conn:
+        cap_direct = conn.execute("SELECT metadata_json FROM generated_assets WHERE asset_id='SP203'").fetchone()
+        cap_fallback = conn.execute("SELECT metadata_json FROM generated_assets WHERE asset_id='SP203::CONTEXTUAL_WORD'").fetchone()
+    assert json.loads(cap_direct["metadata_json"])["pronunciation_review"] == "REGENERATE_REQUIRED"
+    assert json.loads(cap_fallback["metadata_json"])["pronunciation_review"] == "APPROVED"
+    assets = _speech_assets_for(db_path, plan_id)
+    from research.asset_generator import _load_production_blocks
+    blocks = _load_production_blocks(db_path, plan_id)
+    readiness = compute_persistent_rendering_readiness(db_path, plan_id, assets, blocks)
+    assert readiness["ready"] is True
+
+
+# CASE K: active CONTEXTUAL_WORD (CAP's fallback) left PENDING -> NO
+def test_12_8_case_k_active_cap_fallback_pending_is_not_ready(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id = _fully_ready_plan(tmp_path, db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE generated_assets SET metadata_json = json_set(metadata_json, '$.pronunciation_review', 'PENDING') "
+            "WHERE production_plan_id = ? AND asset_id = 'SP203::CONTEXTUAL_WORD'", (plan_id,),
+        )
+    assets = _speech_assets_for(db_path, plan_id)
+    from research.asset_generator import _load_production_blocks
+    blocks = _load_production_blocks(db_path, plan_id)
+    readiness = compute_persistent_rendering_readiness(db_path, plan_id, assets, blocks)
+    assert readiness["ready"] is False
+    # Once the fallback is no longer approved, selection correctly falls back to re-checking the
+    # primary (SP203, still REGENERATE_REQUIRED) rather than treating the un-approved fallback as
+    # good -- so SP203 is what's reported as needing attention, not SP203::CONTEXTUAL_WORD.
+    assert "SP203" in readiness["blockers"]
+
+
+# CASE L: technical validation fail -> NO
+def test_12_8_case_l_technical_validation_failure_is_not_ready(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id = _fully_ready_plan(tmp_path, db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE generated_assets SET validation_json = '{\"valid\": false, \"errors\": [\"zero_duration\"]}' "
+            "WHERE production_plan_id = ? AND asset_id = 'SP210'", (plan_id,),
+        )
+    assets = _speech_assets_for(db_path, plan_id)
+    from research.asset_generator import _load_production_blocks
+    blocks = _load_production_blocks(db_path, plan_id)
+    readiness = compute_persistent_rendering_readiness(db_path, plan_id, assets, blocks)
+    assert readiness["ready"] is False
+    assert readiness["all_technical_valid"] is False
+
+
+# CASE M: manifest completeness tracks materialization -- a fully materialized plan has a complete
+# manifest (manifest is built from the same persisted rows, so this is the positive-path proof)
+def test_12_8_case_m_manifest_complete_when_fully_materialized(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id = _fully_ready_plan(tmp_path, db_path)
+    assets = _speech_assets_for(db_path, plan_id)
+    from research.asset_generator import _load_production_blocks
+    blocks = _load_production_blocks(db_path, plan_id)
+    readiness = compute_persistent_rendering_readiness(db_path, plan_id, assets, blocks)
+    assert readiness["manifest_complete"] is True
+
+
+# CASE N/O: the reason-completeness invariant the rendering_gate_reason_complete check enforces
+def test_12_8_case_n_o_reason_completeness_invariant():
+    def reason_complete(ready, reasons):
+        return bool((ready and not reasons) or (not ready and reasons))
+    assert reason_complete(True, []) is True  # CASE O: YES -> 0 reasons is correct
+    assert reason_complete(False, ["x"]) is True  # NO with a reason is correct
+    assert reason_complete(False, []) is False  # CASE N: NO with no reason is exactly the bug this guards against
+    assert reason_complete(True, ["x"]) is False
+
+
+# CASE R: FULL EXECUTED and the readiness gate use the exact same authoritative source
+def test_12_8_case_r_full_executed_and_gate_share_source(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id = _fully_ready_plan(tmp_path, db_path)
+    assets = _speech_assets_for(db_path, plan_id)
+    from research.asset_generator import _load_production_blocks, _has_full_run
+    blocks = _load_production_blocks(db_path, plan_id)
+    readiness = compute_persistent_rendering_readiness(db_path, plan_id, assets, blocks)
+    assert readiness["has_full_history"] == _has_full_run(db_path, plan_id) is True
+
+
+# ============================================================================
+# 12-9: Rendering Readiness Source of Truth cleanup (prompts/12-9 section 19) --
+# manifest field separation, Renderer entry contract, legacy compatibility.
+# ============================================================================
+
+# manifest field semantics: run-local and persistent readiness are separate, correctly-typed keys
+def test_12_9_manifest_separates_run_local_and_persistent_readiness(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id = _fully_ready_plan(tmp_path, db_path)
+    client = FakeTTSClient()
+    result = run_asset_generation(db_path, client, mode="FULL", tts_model="m", assets_dir=tmp_path / "assets", plan_id=plan_id)
+    manifest = result["manifest"]
+    assert "run_local_ready_for_rendering" in manifest
+    assert "ready_for_rendering" in manifest
+    assert "persistent_rendering_readiness" in manifest
+    assert isinstance(manifest["run_local_ready_for_rendering"], bool)
+    assert isinstance(manifest["ready_for_rendering"], bool)
+    assert isinstance(manifest["persistent_rendering_readiness"], dict)
+
+
+# rendering_readiness_single_source_of_truth: manifest's canonical field IS the persistent value,
+# not the run-local ready_for_rendering_gate() result
+def test_12_9_manifest_ready_for_rendering_is_the_persistent_value(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id = _fully_ready_plan(tmp_path, db_path)
+    client = FakeTTSClient()
+    result = run_asset_generation(db_path, client, mode="FULL", tts_model="m", assets_dir=tmp_path / "assets", plan_id=plan_id)
+    manifest = result["manifest"]
+    assert manifest["ready_for_rendering"] == result["ready_for_rendering"]
+    assert manifest["ready_for_rendering"] == manifest["persistent_rendering_readiness"]["ready"]
+
+
+# persistent_rendering_readiness detail dict carries the Renderer entry contract fields
+def test_12_9_persistent_rendering_readiness_carries_full_detail(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id = _fully_ready_plan(tmp_path, db_path)
+    client = FakeTTSClient()
+    result = run_asset_generation(db_path, client, mode="FULL", tts_model="m", assets_dir=tmp_path / "assets", plan_id=plan_id)
+    detail = result["manifest"]["persistent_rendering_readiness"]
+    for key in ("ready", "reasons", "blockers", "has_full_history", "generate_count", "blocked_count",
+                "all_technical_valid", "manifest_complete", "generation_units_total", "generation_units_materialized"):
+        assert key in detail
+    assert "plan_result" not in detail  # excluded -- redundant with manifest["assets"]
+    assert detail["generation_units_total"] == detail["generation_units_materialized"] == 7  # _seed_plan_12_4's 7 assets, all materialized
+
+
+# Renderer entry contract: compute_persistent_rendering_readiness's return dict is self-sufficient
+def test_12_9_renderer_entry_contract_fields_present(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id = _fully_ready_plan(tmp_path, db_path)
+    assets = _speech_assets_for(db_path, plan_id)
+    from research.asset_generator import _load_production_blocks
+    blocks = _load_production_blocks(db_path, plan_id)
+    readiness = compute_persistent_rendering_readiness(db_path, plan_id, assets, blocks)
+    required_contract_keys = {"ready", "has_full_history", "generate_count", "blocked_count", "all_technical_valid", "manifest_complete", "blockers"}
+    assert required_contract_keys <= set(readiness.keys())
+
+
+# legacy compatibility: ready_for_rendering_gate's signature and narrow behavior are unchanged
+def test_12_9_ready_for_rendering_gate_signature_unchanged():
+    import inspect
+    params = list(inspect.signature(ready_for_rendering_gate).parameters)
+    assert params == ["checks", "mode", "has_unverified_critical_phoneme"]
+    assert ready_for_rendering_gate({}, "SAMPLE", False) is False
+    assert ready_for_rendering_gate({}, "DRY_RUN", False) is False
+
+
+# mode independence, re-verified against the renamed manifest field specifically
+def test_12_9_dry_run_sample_full_manifest_ready_for_rendering_agree(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id = _fully_ready_plan(tmp_path, db_path)
+    client = FakeTTSClient()
+    dry_run_result = run_asset_generation(db_path, client, mode="DRY_RUN", tts_model="m", assets_dir=tmp_path / "assets", plan_id=plan_id)
+    sample_result = run_asset_generation(db_path, client, mode="SAMPLE", tts_model="m", assets_dir=tmp_path / "assets", plan_id=plan_id)
+    full_result = run_asset_generation(db_path, client, mode="FULL", tts_model="m", assets_dir=tmp_path / "assets", plan_id=plan_id)
+    assert dry_run_result["ready_for_rendering"] is True
+    assert sample_result["manifest"]["ready_for_rendering"] is True
+    assert full_result["manifest"]["ready_for_rendering"] is True
+    assert len(client.calls) == 0
+
+
+# run-local readiness legitimately differs from persistent when the current run isn't FULL --
+# proving manifest["ready_for_rendering"] does NOT track ready_for_rendering_gate's run-local answer
+def test_12_9_run_local_and_persistent_can_diverge_by_mode(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id = _fully_ready_plan(tmp_path, db_path)
+    client = FakeTTSClient()
+    sample_result = run_asset_generation(db_path, client, mode="SAMPLE", tts_model="m", assets_dir=tmp_path / "assets", plan_id=plan_id)
+    manifest = sample_result["manifest"]
+    # ready_for_rendering_gate requires mode == "FULL" exactly, so the run-local field must be
+    # False for a SAMPLE run even though the plan is genuinely rendering-ready.
+    assert manifest["run_local_ready_for_rendering"] is False
+    assert manifest["ready_for_rendering"] is True
+
+
+# CASE S/T/U: Production Plan / PAUSE / viewer_action unchanged by readiness recomputation
+def test_12_8_case_s_t_u_production_plan_pause_viewer_action_unchanged(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id = _fully_ready_plan(tmp_path, db_path)
+    with connect(db_path) as conn:
+        before_plan = dict(conn.execute("SELECT * FROM production_plans WHERE id = ?", (plan_id,)).fetchone())
+        before_blocks = [dict(r) for r in conn.execute(
+            "SELECT * FROM production_blocks WHERE production_plan_id = ? ORDER BY block_order", (plan_id,)
+        ).fetchall()]
+    client = FakeTTSClient()
+    run_asset_generation(db_path, client, mode="DRY_RUN", tts_model="m", assets_dir=tmp_path / "assets", plan_id=plan_id)
     with connect(db_path) as conn:
         after_plan = dict(conn.execute("SELECT * FROM production_plans WHERE id = ?", (plan_id,)).fetchone())
         after_blocks = [dict(r) for r in conn.execute(

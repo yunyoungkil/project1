@@ -38,10 +38,14 @@ from research.click_analysis import build_click_analysis_report
 from research.content_packages import build_content_packages_report
 from research.production_blueprint import build_production_blueprint_report
 from research.production_planner import build_production_plan_report
+from research.render_spec import run_render_spec
+from research.scene_layout import run_scene_layout
 from research.script_writer import build_script_report
+from research.timeline_compiler import run_timeline_compiler
 from research.topic_candidates import build_topic_candidates_report
 from research.tts_client import GeminiTTSClient
 from research.video_director import build_video_direction_report
+from research.visual_design import CANDIDATES, run_approve_visual_design, run_correct_visual_approval, run_font_family_review, run_visual_design
 from research.weekly_report import build_weekly_report
 from research.youtube_client import YouTubeClient
 from research.youtube_search import estimate_search_units, run_category_search
@@ -581,6 +585,127 @@ def cmd_assets_review(args, cfg):
         print(f"Recorded tone_consistency_review {asset_id} -> {status} ({updated} row(s) updated)")
 
 
+def cmd_render_spec(args, cfg):
+    log_stage_start("RENDER-SPEC", "12-9 canonical Ready for Rendering을 기준으로 Renderer-neutral Render Specification 컴파일 (신규 API 호출 없음)")
+    result = run_render_spec(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id)
+    if result["blocked"]:
+        print("Renderer Entry Gate: NO", file=sys.stderr)
+        for reason in result["reasons"]:
+            print(f"- {reason}", file=sys.stderr)
+        print(f"Report written to {result['report_path']}")
+        log_stage_done("RENDER-SPEC", "blocked -- see report")
+        return result["report_path"]
+    print(f"render_spec.json written to {result['json_path']}")
+    print(f"Report written to {result['report_path']}")
+    print(f"Ready for Timeline Compilation: {'YES' if result['ready_for_timeline_compilation'] else 'NO'}")
+    log_stage_done("RENDER-SPEC", str(result["report_path"]))
+    return result["report_path"]
+
+
+def cmd_render_timeline(args, cfg):
+    log_stage_start("RENDER-TIMELINE", "13-1 Render Specification을 결정론적 밀리초 Timeline으로 컴파일 (신규 API 호출 없음)")
+    result = run_timeline_compiler(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id)
+    if not result["pass"]:
+        print("Timeline Entry Gate: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        print(f"Report written to {result['report_path']}")
+        log_stage_done("RENDER-TIMELINE", "blocked -- see report")
+        return result["report_path"]
+    print(f"timeline.json written to {result['json_path']}")
+    print(f"Report written to {result['report_path']}")
+    print(f"Ready for Scene/Layout: {'YES' if result['ready_for_scene_layout'] else 'NO'}")
+    log_stage_done("RENDER-TIMELINE", str(result["report_path"]))
+    return result["report_path"]
+
+
+def cmd_render_layout(args, cfg):
+    log_stage_start("RENDER-LAYOUT", "13-2 Timeline을 Renderer-neutral Scene/Layout Model로 컴파일 (신규 API 호출 없음)")
+    result = run_scene_layout(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id)
+    if not result["pass"]:
+        print("Scene/Layout Entry Gate: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        print(f"Report written to {result['report_path']}")
+        log_stage_done("RENDER-LAYOUT", "blocked -- see report")
+        return result["report_path"]
+    print(f"scene_layout.json written to {result['json_path']}")
+    print(f"Report written to {result['report_path']}")
+    print(f"Ready for Visual Design: {'YES' if result['ready_for_visual_design'] else 'NO'}")
+    log_stage_done("RENDER-LAYOUT", str(result["report_path"]))
+    return result["report_path"]
+
+
+def cmd_render_visual_design(args, cfg):
+    log_stage_start("RENDER-VISUAL-DESIGN", "13-3 Scene Layout에 Renderer-neutral Visual Design System을 결합하고 Prototype을 생성 (신규 API 호출 없음)")
+    result = run_visual_design(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id)
+    if not result["pass"]:
+        print("Visual Design Entry Gate: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        print(f"Report written to {result['report_path']}")
+        log_stage_done("RENDER-VISUAL-DESIGN", "blocked -- see report")
+        return result["report_path"]
+    print(f"visual_design.json written to {result['json_path']}")
+    print(f"Prototypes written to {result['prototype_dir']} ({result['prototype_file_count']} files)")
+    print(f"Report written to {result['report_path']}")
+    print(f"Ready for Visual Prototype Review: {'YES' if result['ready_for_visual_prototype_review'] else 'NO'}")
+    print(f"Human Visual Review: {result['human_visual_review_status']}")
+    print(f"Approved Visual Profile: {'YES' if result['approved_visual_profile'] else 'NO'}")
+    log_stage_done("RENDER-VISUAL-DESIGN", str(result["report_path"]))
+    return result["report_path"]
+
+
+def cmd_approve_visual_design(args, cfg):
+    log_stage_start("APPROVE-VISUAL-DESIGN", "13-4B Prototype에 대한 Candidate Selection을 기록 (Full Profile 승인 아님, 신규 API 호출 없음)")
+    result = run_approve_visual_design(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id, candidate=args.candidate)
+    if not result["pass"]:
+        print("Approve Visual Design: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        log_stage_done("APPROVE-VISUAL-DESIGN", "blocked")
+        return None
+    print(f"approved_visual_profile.json written to {result['json_path']}")
+    print(f"Report written to {result['report_path']}")
+    print(f"Candidate selection status: {result['candidate_selection']['candidate_selection_status']}")
+    print(f"Approved categories: {result['category_approvals']['approved_category_count']}/{result['category_approvals']['total_category_count']}")
+    print(f"Ready for Final Renderer Binding: {'YES' if result['ready_for_final_renderer_binding'] else 'NO'}")
+    log_stage_done("APPROVE-VISUAL-DESIGN", str(result["report_path"]))
+    return result["report_path"]
+
+
+def cmd_correct_visual_approval(args, cfg):
+    log_stage_start("CORRECT-VISUAL-APPROVAL", "잘못 기록된 Visual Approval Source of Truth를 이력 보존하며 교정 (신규 API 호출 없음)")
+    result = run_correct_visual_approval(
+        cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id,
+        selected_candidate=args.candidate, corrects_record_id=args.corrects_id,
+    )
+    if not result["pass"]:
+        print("Correct Visual Approval: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        log_stage_done("CORRECT-VISUAL-APPROVAL", "blocked")
+        return None
+    print(f"approved_visual_profile.json written to {result['json_path']}")
+    print(f"Report written to {result['report_path']}")
+    print(f"Canonical candidate: {result['selected_candidate']} (corrects record id={result['corrects_record_id']}, history preserved)")
+    print(f"Manifest revision corrected: {'YES' if result['manifest_corrected'] else 'NO'}")
+    print(f"Unresolved mandatory categories: {result['unresolved_mandatory_categories'] or 'NONE'}")
+    print(f"Ready for Final Renderer Binding: {'YES' if result['ready_for_final_renderer_binding'] else 'NO'}")
+    log_stage_done("CORRECT-VISUAL-APPROVAL", str(result["report_path"]))
+    return result["report_path"]
+
+
+def cmd_review_font_family(args, cfg):
+    log_stage_start("REVIEW-FONT-FAMILY", "CLEAN_DARK_FOCUS Font Family 비교 Prototype 생성 (신규 API 호출 없음, DB 미기록)")
+    result = run_font_family_review(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id)
+    if not result["pass"]:
+        print("Review Font Family: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        log_stage_done("REVIEW-FONT-FAMILY", "blocked")
+        return None
+    print(f"Font review files written to {result['review_dir']} ({result['file_count']} files)")
+    print(f"Report written to {result['report_path']}")
+    print(f"Review first: {result['review_dir'] / 'index.html'}")
+    log_stage_done("REVIEW-FONT-FAMILY", str(result["report_path"]))
+    return result["report_path"]
+
+
 def cmd_run_scheduled(args, cfg):
     weekday = datetime.now().strftime("%A").lower()
     task = cfg.get("schedule", weekday)
@@ -710,6 +835,37 @@ def build_parser() -> argparse.ArgumentParser:
     assets_review.add_argument("--set", action="append", metavar="ASSET_ID=STATUS", help="Record an already-made human pronunciation review verdict (repeatable), e.g. --set SP007=APPROVED")
     assets_review.add_argument("--set-tone", action="append", metavar="ASSET_ID=STATUS", help="Record an already-made human tone_consistency review verdict (repeatable), e.g. --set-tone SP029::CONTEXTUAL_WORD=REJECTED")
     assets_review.set_defaults(func=cmd_assets_review)
+
+    render_spec = sub.add_parser("render-spec", help="Compile the 12-ready Production Plan into a Renderer-neutral Render Specification (no new API calls)")
+    render_spec.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    render_spec.set_defaults(func=cmd_render_spec)
+
+    render_timeline = sub.add_parser("render-timeline", help="Compile a Render Specification into a deterministic millisecond Timeline (no new API calls)")
+    render_timeline.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    render_timeline.set_defaults(func=cmd_render_timeline)
+
+    render_layout = sub.add_parser("render-layout", help="Compile a Timeline into a Renderer-neutral Scene/Layout Model (no new API calls)")
+    render_layout.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    render_layout.set_defaults(func=cmd_render_layout)
+
+    render_visual_design = sub.add_parser("render-visual-design", help="Bind a Renderer-neutral Visual Design System onto a Scene Layout and generate a static HTML Prototype (no new API calls)")
+    render_visual_design.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    render_visual_design.set_defaults(func=cmd_render_visual_design)
+
+    approve_visual_design = sub.add_parser("approve-visual-design", help="Record a real Human Visual Review decision for a Prototype candidate (no new API calls)")
+    approve_visual_design.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    approve_visual_design.add_argument("--candidate", required=True, choices=list(CANDIDATES), help="The Prototype candidate a human has actually reviewed and approved")
+    approve_visual_design.set_defaults(func=cmd_approve_visual_design)
+
+    correct_visual_approval = sub.add_parser("correct-visual-approval", help="Correct a misrecorded Visual Approval Source of Truth, preserving history (no new API calls)")
+    correct_visual_approval.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    correct_visual_approval.add_argument("--candidate", default="CLEAN_DARK_FOCUS", choices=list(CANDIDATES), help="The candidate actually selected by Human Review")
+    correct_visual_approval.add_argument("--corrects-id", type=int, default=2, dest="corrects_id", help="The visual_design_specs row id being superseded (preserved, never modified)")
+    correct_visual_approval.set_defaults(func=cmd_correct_visual_approval)
+
+    review_font_family = sub.add_parser("review-font-family", help="Generate a Font Family comparison Prototype for CLEAN_DARK_FOCUS (no new API calls, no DB writes)")
+    review_font_family.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    review_font_family.set_defaults(func=cmd_review_font_family)
 
     sub.add_parser("run-scheduled", help="Run today's scheduled task from config").set_defaults(func=cmd_run_scheduled)
 
