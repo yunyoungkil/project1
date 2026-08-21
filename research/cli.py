@@ -45,7 +45,7 @@ from research.timeline_compiler import run_timeline_compiler
 from research.topic_candidates import build_topic_candidates_report
 from research.tts_client import GeminiTTSClient
 from research.video_director import build_video_direction_report
-from research.visual_design import CANDIDATES, run_approve_visual_design, run_correct_visual_approval, run_font_family_human_approval, run_font_family_review, run_visual_design
+from research.visual_design import CANDIDATES, run_approve_visual_design, run_caption_style_human_approval, run_caption_style_review, run_color_background_review, run_color_palette_human_approval, run_correct_visual_approval, run_focus_style_human_approval, run_focus_style_review, run_font_family_human_approval, run_font_family_review, run_font_weight_human_approval, run_font_weight_review, run_muted_color_refinement, run_success_style_review, run_typography_scale_human_approval, run_typography_scale_review, run_visual_design
 from research.weekly_report import build_weekly_report
 from research.youtube_client import YouTubeClient
 from research.youtube_search import estimate_search_units, run_category_search
@@ -724,6 +724,197 @@ def cmd_approve_font_family(args, cfg):
     return result["report_path"]
 
 
+def cmd_review_color_background(args, cfg):
+    log_stage_start("REVIEW-COLOR-BACKGROUND", "CLEAN_DARK_FOCUS Color Palette + Background 비교 Prototype 생성 (신규 API 호출 없음, DB 미기록)")
+    result = run_color_background_review(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id)
+    if not result["pass"]:
+        print("Review Color/Background: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        log_stage_done("REVIEW-COLOR-BACKGROUND", "blocked")
+        return None
+    print(f"Review files written to {result['review_dir']} ({result['file_count']} files)")
+    print(f"Report written to {result['report_path']}")
+    print(f"Review first: {result['review_dir'] / 'index.html'}")
+    log_stage_done("REVIEW-COLOR-BACKGROUND", str(result["report_path"]))
+    return result["report_path"]
+
+
+def cmd_review_muted_color(args, cfg):
+    log_stage_start("REVIEW-MUTED-COLOR", "Background Human Approval persist + MUTED Color 비교 Prototype 생성 (신규 API 호출 없음)")
+    result = run_muted_color_refinement(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id)
+    if not result["pass"]:
+        print("Review Muted Color: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        log_stage_done("REVIEW-MUTED-COLOR", "blocked")
+        return None
+    print(f"Approved background: {result['background_approval']['approved_background']}")
+    print(f"Review files written to {result['review_dir']} ({result['file_count']} files)")
+    print(f"Report written to {result['report_path']}")
+    print(f"Review first: {result['review_dir'] / 'index.html'}")
+    log_stage_done("REVIEW-MUTED-COLOR", str(result["report_path"]))
+    return result["report_path"]
+
+
+def cmd_approve_color_palette(args, cfg):
+    log_stage_start("APPROVE-COLOR-PALETTE", "13-4C-8 MUTED Human Review 결정 + 13-4C-7 KEEP 6 role을 결합해 color_palette category 전체 승인 (신규 API 호출 없음)")
+    result = run_color_palette_human_approval(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id)
+    if not result["pass"]:
+        print("Approve Color Palette: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        log_stage_done("APPROVE-COLOR-PALETTE", "blocked")
+        return None
+    print(f"approved_visual_profile.json written to {result['json_path']}")
+    print(f"Report written to {result['report_path']}")
+    print(f"MUTED: {result['muted_info']['label']} ({result['muted_info']['hex']})")
+    print(f"Category approvals: {result['approved_category_count']} APPROVED / {result['pending_category_count']} PENDING")
+    print(f"Ready for Final Renderer Binding: {'YES' if result['ready_for_final_renderer_binding'] else 'NO'}")
+    log_stage_done("APPROVE-COLOR-PALETTE", str(result["report_path"]))
+    return result["report_path"]
+
+
+def cmd_review_typography_scale(args, cfg):
+    log_stage_start("REVIEW-TYPOGRAPHY-SCALE", "CLEAN_DARK_FOCUS Typography Scale 비교 Prototype 생성 (신규 API 호출 없음, DB 미기록)")
+    result = run_typography_scale_review(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id)
+    if not result["pass"]:
+        print("Review Typography Scale: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        log_stage_done("REVIEW-TYPOGRAPHY-SCALE", "blocked")
+        return None
+    print(f"Review files written to {result['review_dir']} ({result['file_count']} files)")
+    print(f"Report written to {result['report_path']}")
+    print(f"Review first: {result['review_dir'] / 'index.html'}")
+    log_stage_done("REVIEW-TYPOGRAPHY-SCALE", str(result["report_path"]))
+    return result["report_path"]
+
+
+def cmd_approve_typography_scale(args, cfg):
+    log_stage_start("APPROVE-TYPOGRAPHY-SCALE", "13-4C-10 Typography Scale Human Review 결정을 typography_scale category로 승인 (신규 API 호출 없음)")
+    result = run_typography_scale_human_approval(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id)
+    if not result["pass"]:
+        print("Approve Typography Scale: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        log_stage_done("APPROVE-TYPOGRAPHY-SCALE", "blocked")
+        return None
+    print(f"Selected candidate: {result['selected_candidate']} {result['approved_sizes']}")
+    print(f"approved_visual_profile.json written to {result['json_path']}")
+    print(f"Report written to {result['report_path']}")
+    print(f"Category approvals: {result['approved_category_count']} APPROVED / {result['pending_category_count']} PENDING")
+    print(f"Ready for Final Renderer Binding: {'YES' if result['ready_for_final_renderer_binding'] else 'NO'}")
+    log_stage_done("APPROVE-TYPOGRAPHY-SCALE", str(result["report_path"]))
+    return result["report_path"]
+
+
+def cmd_review_font_weight(args, cfg):
+    log_stage_start("REVIEW-FONT-WEIGHT", "CLEAN_DARK_FOCUS Font Weight 비교 Prototype 생성 (신규 API 호출 없음, DB 미기록)")
+    result = run_font_weight_review(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id)
+    if not result["pass"]:
+        print("Review Font Weight: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        log_stage_done("REVIEW-FONT-WEIGHT", "blocked")
+        return None
+    print(f"Review files written to {result['review_dir']} ({result['file_count']} files)")
+    print(f"Report written to {result['report_path']}")
+    print(f"Review first: {result['review_dir'] / 'index.html'}")
+    log_stage_done("REVIEW-FONT-WEIGHT", str(result["report_path"]))
+    return result["report_path"]
+
+
+def cmd_approve_font_weight(args, cfg):
+    log_stage_start("APPROVE-FONT-WEIGHT", "13-4C-12 Font Weight Human Review 결정을 font_weight category로 승인 (신규 API 호출 없음)")
+    result = run_font_weight_human_approval(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id)
+    if not result["pass"]:
+        print("Approve Font Weight: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        log_stage_done("APPROVE-FONT-WEIGHT", "blocked")
+        return None
+    print(f"Selected candidate: {result['selected_candidate']} {result['approved_weights']}")
+    print(f"approved_visual_profile.json written to {result['json_path']}")
+    print(f"Report written to {result['report_path']}")
+    print(f"Category approvals: {result['approved_category_count']} APPROVED / {result['pending_category_count']} PENDING")
+    print(f"Ready for Final Renderer Binding: {'YES' if result['ready_for_final_renderer_binding'] else 'NO'}")
+    log_stage_done("APPROVE-FONT-WEIGHT", str(result["report_path"]))
+    return result["report_path"]
+
+
+def cmd_review_caption_style(args, cfg):
+    log_stage_start("REVIEW-CAPTION-STYLE", "CLEAN_DARK_FOCUS Caption Style 비교 Prototype 생성 (신규 API 호출 없음, DB 미기록)")
+    result = run_caption_style_review(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id)
+    if not result["pass"]:
+        print("Review Caption Style: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        log_stage_done("REVIEW-CAPTION-STYLE", "blocked")
+        return None
+    print(f"Review files written to {result['review_dir']} ({result['file_count']} files)")
+    print(f"Report written to {result['report_path']}")
+    print(f"Review first: {result['review_dir'] / 'index.html'}")
+    log_stage_done("REVIEW-CAPTION-STYLE", str(result["report_path"]))
+    return result["report_path"]
+
+
+def cmd_approve_caption_style(args, cfg):
+    log_stage_start("APPROVE-CAPTION-STYLE", "13-4C-14 Caption Style Human Review 결정을 caption_style category로 승인 (신규 API 호출 없음)")
+    result = run_caption_style_human_approval(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id)
+    if not result["pass"]:
+        print("Approve Caption Style: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        log_stage_done("APPROVE-CAPTION-STYLE", "blocked")
+        return None
+    print(f"Selected candidate: {result['selected_candidate']} {result['approved_style']}")
+    print(f"approved_visual_profile.json written to {result['json_path']}")
+    print(f"Report written to {result['report_path']}")
+    print(f"Category approvals: {result['approved_category_count']} APPROVED / {result['pending_category_count']} PENDING")
+    print(f"Ready for Final Renderer Binding: {'YES' if result['ready_for_final_renderer_binding'] else 'NO'}")
+    log_stage_done("APPROVE-CAPTION-STYLE", str(result["report_path"]))
+    return result["report_path"]
+
+
+def cmd_review_focus_style(args, cfg):
+    log_stage_start("REVIEW-FOCUS-STYLE", "CLEAN_DARK_FOCUS Focus Style 비교 Prototype 생성 (신규 API 호출 없음, DB 미기록)")
+    result = run_focus_style_review(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id)
+    if not result["pass"]:
+        print("Review Focus Style: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        log_stage_done("REVIEW-FOCUS-STYLE", "blocked")
+        return None
+    print(f"Review files written to {result['review_dir']} ({result['file_count']} files)")
+    print(f"Report written to {result['report_path']}")
+    print(f"Review first: {result['review_dir'] / 'index.html'}")
+    log_stage_done("REVIEW-FOCUS-STYLE", str(result["report_path"]))
+    return result["report_path"]
+
+
+def cmd_approve_focus_style(args, cfg):
+    log_stage_start("APPROVE-FOCUS-STYLE", "13-4C-16 Focus Style Human Review 결정을 focus_style category로 승인 (신규 API 호출 없음)")
+    result = run_focus_style_human_approval(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id)
+    if not result["pass"]:
+        print("Approve Focus Style: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        log_stage_done("APPROVE-FOCUS-STYLE", "blocked")
+        return None
+    print(f"Selected candidate: {result['selected_candidate']} {result['approved_style']}")
+    print(f"approved_visual_profile.json written to {result['json_path']}")
+    print(f"Report written to {result['report_path']}")
+    print(f"Category approvals: {result['approved_category_count']} APPROVED / {result['pending_category_count']} PENDING")
+    print(f"Ready for Final Renderer Binding: {'YES' if result['ready_for_final_renderer_binding'] else 'NO'}")
+    log_stage_done("APPROVE-FOCUS-STYLE", str(result["report_path"]))
+    return result["report_path"]
+
+
+def cmd_review_success_style(args, cfg):
+    log_stage_start("REVIEW-SUCCESS-STYLE", "CLEAN_DARK_FOCUS Success Style 비교 Prototype 생성 (신규 API 호출 없음, DB 미기록)")
+    result = run_success_style_review(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id)
+    if not result["pass"]:
+        print("Review Success Style: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        log_stage_done("REVIEW-SUCCESS-STYLE", "blocked")
+        return None
+    print(f"Review files written to {result['review_dir']} ({result['file_count']} files)")
+    print(f"Report written to {result['report_path']}")
+    print(f"Review first: {result['review_dir'] / 'index.html'}")
+    log_stage_done("REVIEW-SUCCESS-STYLE", str(result["report_path"]))
+    return result["report_path"]
+
+
 def cmd_run_scheduled(args, cfg):
     weekday = datetime.now().strftime("%A").lower()
     task = cfg.get("schedule", weekday)
@@ -888,6 +1079,54 @@ def build_parser() -> argparse.ArgumentParser:
     approve_font_family = sub.add_parser("approve-font-family", help="Persist the real Human Review font_family approval (VERDANA_HUMANIST only, no new API calls)")
     approve_font_family.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
     approve_font_family.set_defaults(func=cmd_approve_font_family)
+
+    review_color_background = sub.add_parser("review-color-background", help="Generate a Color Palette + Background Human Review Prototype for CLEAN_DARK_FOCUS (no new API calls, no DB writes)")
+    review_color_background.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    review_color_background.set_defaults(func=cmd_review_color_background)
+
+    review_muted_color = sub.add_parser("review-muted-color", help="Persist the real Human Review background approval and generate a MUTED color comparison Prototype (no new API calls)")
+    review_muted_color.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    review_muted_color.set_defaults(func=cmd_review_muted_color)
+
+    approve_color_palette = sub.add_parser("approve-color-palette", help="Persist the real Human Review color_palette approval (MUTED=MODERATE + 6 KEEP roles, no new API calls)")
+    approve_color_palette.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    approve_color_palette.set_defaults(func=cmd_approve_color_palette)
+
+    review_typography_scale = sub.add_parser("review-typography-scale", help="Generate a Typography Scale comparison Prototype for CLEAN_DARK_FOCUS (no new API calls, no DB writes)")
+    review_typography_scale.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    review_typography_scale.set_defaults(func=cmd_review_typography_scale)
+
+    approve_typography_scale = sub.add_parser("approve-typography-scale", help="Persist the real Human Review typography_scale approval (LARGE_BEGINNER only, no new API calls)")
+    approve_typography_scale.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    approve_typography_scale.set_defaults(func=cmd_approve_typography_scale)
+
+    review_font_weight = sub.add_parser("review-font-weight", help="Generate a Font Weight comparison Prototype for CLEAN_DARK_FOCUS (no new API calls, no DB writes)")
+    review_font_weight.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    review_font_weight.set_defaults(func=cmd_review_font_weight)
+
+    approve_font_weight = sub.add_parser("approve-font-weight", help="Persist the real Human Review font_weight approval (BALANCED_HIERARCHY only, no new API calls)")
+    approve_font_weight.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    approve_font_weight.set_defaults(func=cmd_approve_font_weight)
+
+    review_caption_style = sub.add_parser("review-caption-style", help="Generate a Caption Style comparison Prototype for CLEAN_DARK_FOCUS (no new API calls, no DB writes)")
+    review_caption_style.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    review_caption_style.set_defaults(func=cmd_review_caption_style)
+
+    approve_caption_style = sub.add_parser("approve-caption-style", help="Persist the real Human Review caption_style approval (BALANCED_INTEGRATED only, no new API calls)")
+    approve_caption_style.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    approve_caption_style.set_defaults(func=cmd_approve_caption_style)
+
+    review_focus_style = sub.add_parser("review-focus-style", help="Generate a Focus Style comparison Prototype for CLEAN_DARK_FOCUS (no new API calls, no DB writes)")
+    review_focus_style.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    review_focus_style.set_defaults(func=cmd_review_focus_style)
+
+    approve_focus_style = sub.add_parser("approve-focus-style", help="Persist the real Human Review focus_style approval (COLOR_ONLY only, no new API calls)")
+    approve_focus_style.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    approve_focus_style.set_defaults(func=cmd_approve_focus_style)
+
+    review_success_style = sub.add_parser("review-success-style", help="Generate a Success Style comparison Prototype for CLEAN_DARK_FOCUS (no new API calls, no DB writes)")
+    review_success_style.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    review_success_style.set_defaults(func=cmd_review_success_style)
 
     sub.add_parser("run-scheduled", help="Run today's scheduled task from config").set_defaults(func=cmd_run_scheduled)
 

@@ -1,8 +1,24 @@
-# 한국 영어교육 YouTube 시장 리서치 자동화
+# 한국 영어교육 YouTube 콘텐츠 제작 자동화
 
-채널 "이해하면 쉬운 영어"를 위해 한국 영어교육 YouTube 시장을 자동 조사하여, 작은/중간 채널의
-비정상적 성과 영상(outlier)을 탐지하고 내 채널 성과와 결합해 매주 콘텐츠 제작 후보 TOP3를
-추천하는 시스템입니다.
+채널 "이해하면 쉬운 영어"(영어 알파벳-소리 대응이 안 되는 성인 완전 초보자 대상)를 위한
+시장 리서치 → 토픽/스크립트/프로덕션 기획 → 실제 음성 에셋 생성 → 렌더링 준비 파이프라인입니다.
+
+1. **시장 리서치**: 한국 영어교육 YouTube 시장을 자동 조사하여 작은/중간 채널의 비정상적 성과
+   영상(outlier)을 탐지하고 내 채널 성과와 결합해 매주 콘텐츠 제작 후보 TOP3를 추천
+2. **콘텐츠 기획**: 리서치에서 나온 Viewer Problem을 Topic → Title/Thumbnail Package →
+   Production Blueprint → Content Script → Video Direction → Production Plan 순서로 구체화
+3. **에셋 생성**: Production Plan의 Speech Asset을 실제 Gemini TTS로 음성 파일 생성 + 검증
+4. **렌더링 준비**: 검증된 Production Plan을 Renderer-neutral Render Spec → Timeline → Scene
+   Layout → Visual Design(색/타이포/폰트) 순서로 컴파일하고 Human Review 승인을 기록 (실제 영상
+   렌더링 엔진은 아직 구현되지 않음 — 13단계는 렌더링 "직전"까지)
+
+각 단계는 이전 단계의 DB 데이터를 read-only로 소비하고, 사람이 검토/승인해야 하는 지점은 별도
+CLI 명령과 append-only DB row로 명시적으로 분리되어 있습니다 (자동으로 다음 단계까지 승인되는
+경우가 없습니다).
+
+> 현재 진행 상태(어느 category가 승인됐는지, 다음 할 일이 무엇인지)는 이 README가 아니라
+> [`PROJECT_STATE.md`](PROJECT_STATE.md)에서 확인하세요 — 다음 단계를 시작하기 전에 먼저 읽고,
+> 반드시 실제 DB/canonical artifact로 재검증한 뒤 진행하세요.
 
 ## 설치
 
@@ -22,6 +38,8 @@ cp .env.example .env   # 값 채우기 (이미 .env가 있다면 생략)
 
 ## CLI 명령
 
+### 1) 시장 리서치
+
 ```bash
 python -m research.cli auth                       # 1회 OAuth 동의 (로컬 브라우저 필요)
 python -m research.cli keywords list               # keyword pool 조회
@@ -38,6 +56,60 @@ python -m research.cli run-all                       # 전체 카테고리 파�
 
 `--query-limit N` 옵션으로 `search`/`run-all` 실행 시 카테고리당 검색어 수를 제한할 수 있습니다
 (테스트/quota 절약용).
+
+### 2) 콘텐츠 기획 (신규 API 호출 없음 — DB 데이터로만 계산/Gemini 텍스트 생성)
+
+```bash
+python -m research.cli topics --top 20              # Viewer Problem -> Topic Candidate 랭킹
+python -m research.cli clicks --top 10               # 선택된 Topic의 outlier 영상이 왜 클릭됐는지 분석
+python -m research.cli packages --top 10             # Topic -> Title x Thumbnail Package 생성
+python -m research.cli blueprint                     # 선택된 Package -> Production Blueprint 생성
+python -m research.cli script                        # 승인된 Blueprint -> 포맷-중립 Content Script 생성
+python -m research.cli direction                     # Content Script -> 영상 포맷 + 블록별 연출(Video Direction) 결정
+python -m research.cli production-plan               # Video Direction -> Production Plan(정확한 speech/visual/pause 순서) 컴파일
+```
+
+각 명령은 `--*-id`(예: `--package-id`, `--blueprint-id`, `--script-id`)로 특정 row를 지정하지
+않으면 이전 단계에서 "이 단계로 넘길 준비가 됐다"고 표시된 가장 최근 row를 자동으로 사용합니다.
+
+### 3) 에셋 생성 (실제 Gemini TTS API 호출)
+
+```bash
+python -m research.cli assets --dry-run              # 실제 호출 없이 생성될 에셋 수/예상 API 호출 수만 확인
+python -m research.cli assets --sample                # Sample Matrix 생성 (전략 검증용 소량 실제 TTS 호출)
+python -m research.cli assets                         # 승인된 Production Plan의 전체 Speech Asset을 실제 Gemini TTS로 생성 + 검증
+python -m research.cli assets-review                  # 사람 발음 검토 대기 목록 조회
+python -m research.cli assets-review --set SP007=APPROVED --set-tone SP029::CONTEXTUAL_WORD=REJECTED
+```
+
+### 4) 렌더링 준비 (신규 API 호출 없음, 실제 렌더러는 아직 없음)
+
+```bash
+python -m research.cli render-spec                    # Production Plan -> Renderer-neutral Render Specification
+python -m research.cli render-timeline                 # Render Spec -> 밀리초 단위 결정론적 Timeline
+python -m research.cli render-layout                   # Timeline -> Scene/Layout Model(Zone 구조)
+python -m research.cli render-visual-design             # Scene Layout -> Visual Design System + 정적 HTML Prototype
+python -m research.cli approve-visual-design --candidate CLEAN_DARK_FOCUS   # Prototype에 대한 실제 Human Review Candidate 선택 기록
+python -m research.cli correct-visual-approval --candidate CLEAN_DARK_FOCUS --corrects-id 2  # 잘못 기록된 승인을 이력 보존하며 교정
+python -m research.cli review-font-family               # Font Family 비교 Prototype 생성 (DB 미기록)
+python -m research.cli approve-font-family               # Font Family Human Review 승인 기록 (font_family category만)
+python -m research.cli review-color-background           # Color Palette + Background 비교 Prototype 생성 (DB 미기록)
+python -m research.cli review-muted-color                 # Background Human Approval 기록 + MUTED 후보 비교 Prototype 생성
+python -m research.cli approve-color-palette              # Color Palette Human Review 승인 기록 (7 role 전체)
+python -m research.cli review-typography-scale             # Typography Scale 비교 Prototype 생성 (DB 미기록)
+python -m research.cli approve-typography-scale             # Typography Scale Human Review 승인 기록 (typography_scale category만)
+python -m research.cli review-font-weight                    # Font Weight 비교 Prototype 생성 (DB 미기록)
+python -m research.cli approve-font-weight                    # Font Weight Human Review 승인 기록 (font_weight category만)
+python -m research.cli review-caption-style                    # Caption Style 비교 Prototype 생성 (DB 미기록)
+python -m research.cli approve-caption-style                   # Caption Style Human Review 승인 기록 (caption_style category만)
+python -m research.cli review-focus-style                      # Focus Style 비교 Prototype 생성 (DB 미기록)
+python -m research.cli approve-focus-style                     # Focus Style Human Review 승인 기록 (focus_style category만)
+python -m research.cli review-success-style                    # Success Style 비교 Prototype 생성 (DB 미기록)
+```
+
+모든 승인 명령(`approve-*`, `correct-*`)은 append-only입니다 — 기존 row를 수정하지 않고 새 row를
+추가하며, 승인 category 하나가 전체 Visual Profile을 자동으로 승인하지 않습니다
+(`ready_for_final_renderer_binding`은 필수 category가 모두 APPROVED여야 True).
 
 ## 아키텍처
 
@@ -58,6 +130,23 @@ research/
   content_pattern_analyzer.py 제목 패턴: rule-based + Gemini 보강
   my_channel.py                내 채널 Analytics + market_demand/my_fit/content_opportunity
   weekly_report.py             주간 마크다운 리포트 생성
+  progress.py                  터미널 진행 상태 로깅 (분석 로직에 영향 없음, 관찰 전용)
+
+  topic_candidates.py          Viewer Problem -> Topic Candidate (시장 근거 기반, 결정론적 점수)
+  click_analysis.py            선택된 Topic의 outlier 영상이 왜 클릭됐는지 (Click Evidence Score)
+  content_packages.py          Topic -> Title x Thumbnail Package (Package Score, Topic/Click과 독립)
+  production_blueprint.py      Package -> Production Blueprint (Viewer Contract, 섹션 구조, Integrity Check)
+  script_writer.py             Blueprint -> 포맷-중립 Content Script (영상 포맷은 아직 결정 안 함)
+  video_director.py             Content Script -> Video Direction (포맷 + 블록별 연출 결정)
+  production_planner.py         Video Direction -> Production Plan (speech/visual/pause 정확한 순서, TTS 미호출)
+  asset_generator.py            Production Plan -> 실제 Gemini TTS 호출 + WAV 생성 + 검증
+  tts_client.py                  Gemini TTS REST 래퍼 (실패 시 None, google-genai SDK 미사용)
+
+  render_spec.py                13-1: Production Plan -> Renderer-neutral Render Specification
+  timeline_compiler.py          13-2: Render Spec -> 밀리초 단위 결정론적 Timeline
+  scene_layout.py                13-3: Timeline -> Scene/Layout Model (Zone 구조, 픽셀 좌표 아님)
+  visual_design.py               13-4: Scene Layout -> Visual Design System + HTML Prototype +
+                                  Human Review 승인 기록 (append-only, category별 개별 승인)
   cli.py                       위 전체를 묶는 CLI
 ```
 
@@ -177,11 +266,12 @@ schtasks /Create /TN "YouTube Research Daily" /SC DAILY /ST 09:00 ^
 pytest tests/
 ```
 
-핵심 계산 로직(median/mean baseline, outlier_ratio, subscriber_ratio, views_per_day,
-opportunity_score, content_type 분류, 결측치/0-division 처리, min_grade 필터링, keyword pool의
-problem 매칭이 결정론적인지, 카테고리 TOP5가 독립적으로 나오는지, "이번 주" 필터가 발견 시점을
-반영하는지, viewer problem 빈도가 중복 매치로 부풀지 않는지, archetype이 고정 taxonomy로만
-나오는지)에 대한 mock 기반 unit test 81개가 포함되어 있으며 실제 API를 호출하지 않습니다.
+실제 API를 호출하지 않는 mock/fake 기반 unit test 835개가 포함되어 있습니다. 리서치 핵심 계산
+로직(median/mean baseline, outlier_ratio, subscriber_ratio, views_per_day, opportunity_score,
+content_type 분류, 결측치/0-division 처리, min_grade 필터링, keyword pool problem 매칭, "이번 주"
+필터, viewer problem 빈도 집계, archetype 고정 taxonomy)뿐 아니라, 콘텐츠 기획 파이프라인 각
+단계의 read-only 상류 데이터 보존, 에셋 생성의 실패/재시도 처리, 렌더링 준비 단계의 append-only
+Human Review 승인(잘못된 category 자동 승인 금지, 기존 row 불변 등)까지 포함합니다.
 
 ## 알려진 한계
 
@@ -198,3 +288,16 @@ problem 매칭이 결정론적인지, 카테고리 TOP5가 독립적으로 나�
 - YouTube 공식 API는 Shorts 여부를 직접 제공하지 않아 duration 기반 추정에 의존합니다.
 - `research run-scheduled`를 실제로 매일 자동 실행하려면 위 작업 스케줄러 등록을 사용자가 직접
   해야 합니다 (코드가 스스로 등록하지 않음).
+- 실제 영상을 픽셀로 그리는 Renderer(14+)는 아직 구현되지 않았습니다. 13단계는 Render Spec/
+  Timeline/Scene Layout/Visual Design까지만 컴파일하며, 이 JSON들을 실제로 읽어 MP4를 만드는
+  엔진은 별도 단계입니다.
+- Visual Profile의 15개 category 중 `font_family`(`VERDANA_HUMANIST`)/`background`(`#111318`)/
+  `color_palette`(7 role 전체 확정, `MUTED`는 3개 후보 중 Human Review로 `#757b87` 선택)/
+  `typography_scale`(3개 후보 중 Human Review로 `LARGE_BEGINNER` 72/46/28/20/15px 선택)/
+  `font_weight`(3개 후보 중 Human Review로 `BALANCED_HIERARCHY` 800/700/500/400/400 선택, DOMINANT·
+  SUPPORTING은 Verdana native가 아닌 synthetic weight)/`caption_style`(3개 후보 중 Human Review로
+  `BALANCED_INTEGRATED` 선택: text_color_role=DEFAULT, background=box, opacity=0.55,
+  padding=8px 16px, line_height=1.5)/`focus_style`(3개 후보 중 Human Review로 `COLOR_ONLY` 선택:
+  color_role=PRIMARY_FOCUS(#60a5fa), highlight_box 없음, underline 없음 — 승인된 색만 사용하고 추가
+  표현 없음) 7개만 현재 Human Review 승인 완료 상태이며, 나머지 8개는 아직 `PENDING_VISUAL_REVIEW`라
+  `ready_for_final_renderer_binding`은 여전히 `False`입니다.
