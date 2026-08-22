@@ -45,7 +45,7 @@ from research.timeline_compiler import run_timeline_compiler
 from research.topic_candidates import build_topic_candidates_report
 from research.tts_client import GeminiTTSClient
 from research.video_director import build_video_direction_report
-from research.visual_design import CANDIDATES, run_approve_visual_design, run_caption_style_human_approval, run_caption_style_review, run_color_background_review, run_color_palette_human_approval, run_correct_visual_approval, run_focus_style_human_approval, run_focus_style_review, run_font_family_human_approval, run_font_family_review, run_font_weight_human_approval, run_font_weight_review, run_muted_color_refinement, run_success_style_review, run_typography_scale_human_approval, run_typography_scale_review, run_visual_design
+from research.visual_design import CANDIDATES, run_approve_visual_design, run_caption_style_human_approval, run_caption_style_review, run_color_background_review, run_color_palette_human_approval, run_correct_visual_approval, run_focus_style_human_approval, run_focus_style_review, run_font_family_human_approval, run_font_family_review, run_font_weight_human_approval, run_font_weight_review, run_muted_color_refinement, run_success_style_human_approval, run_success_style_review, run_typography_scale_human_approval, run_typography_scale_review, run_visual_design
 from research.weekly_report import build_weekly_report
 from research.youtube_client import YouTubeClient
 from research.youtube_search import estimate_search_units, run_category_search
@@ -915,6 +915,23 @@ def cmd_review_success_style(args, cfg):
     return result["report_path"]
 
 
+def cmd_approve_success_style(args, cfg):
+    log_stage_start("APPROVE-SUCCESS-STYLE", "13-4C-18 Success Style Human Review 결정을 success_style category로 승인 (신규 API 호출 없음)")
+    result = run_success_style_human_approval(cfg.db_path, cfg.assets_dir, cfg.reports_dir, plan_id=args.plan_id)
+    if not result["pass"]:
+        print("Approve Success Style: NO", file=sys.stderr)
+        print(f"- {result['reason']}", file=sys.stderr)
+        log_stage_done("APPROVE-SUCCESS-STYLE", "blocked")
+        return None
+    print(f"Selected candidate: {result['selected_candidate']} {result['approved_style']}")
+    print(f"approved_visual_profile.json written to {result['json_path']}")
+    print(f"Report written to {result['report_path']}")
+    print(f"Category approvals: {result['approved_category_count']} APPROVED / {result['pending_category_count']} PENDING")
+    print(f"Ready for Final Renderer Binding: {'YES' if result['ready_for_final_renderer_binding'] else 'NO'}")
+    log_stage_done("APPROVE-SUCCESS-STYLE", str(result["report_path"]))
+    return result["report_path"]
+
+
 def cmd_run_scheduled(args, cfg):
     weekday = datetime.now().strftime("%A").lower()
     task = cfg.get("schedule", weekday)
@@ -1127,6 +1144,10 @@ def build_parser() -> argparse.ArgumentParser:
     review_success_style = sub.add_parser("review-success-style", help="Generate a Success Style comparison Prototype for CLEAN_DARK_FOCUS (no new API calls, no DB writes)")
     review_success_style.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
     review_success_style.set_defaults(func=cmd_review_success_style)
+
+    approve_success_style = sub.add_parser("approve-success-style", help="Persist the real Human Review success_style approval (COLOR_ONLY only, no new API calls)")
+    approve_success_style.add_argument("--plan-id", type=int, default=None, help="Use a specific production_plans id instead of the latest ready plan")
+    approve_success_style.set_defaults(func=cmd_approve_success_style)
 
     sub.add_parser("run-scheduled", help="Run today's scheduled task from config").set_defaults(func=cmd_run_scheduled)
 

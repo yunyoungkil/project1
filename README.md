@@ -105,6 +105,7 @@ python -m research.cli approve-caption-style                   # Caption Style H
 python -m research.cli review-focus-style                      # Focus Style 비교 Prototype 생성 (DB 미기록)
 python -m research.cli approve-focus-style                     # Focus Style Human Review 승인 기록 (focus_style category만)
 python -m research.cli review-success-style                    # Success Style 비교 Prototype 생성 (DB 미기록)
+python -m research.cli approve-success-style                   # Success Style Human Review 승인 기록 (success_style category만)
 ```
 
 모든 승인 명령(`approve-*`, `correct-*`)은 append-only입니다 — 기존 row를 수정하지 않고 새 row를

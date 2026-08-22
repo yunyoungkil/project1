@@ -4671,3 +4671,178 @@ def _build_success_style_review_report(reports_dir: Path, plan_id: int, sizes: d
     out_path = reports_dir / f"success_style_review_{datetime.utcnow().date().isoformat()}.md"
     out_path.write_text("\n".join(lines), encoding="utf-8")
     return out_path
+
+
+# ---------------------------------------------------------------------------
+# 13-4C-19: Success Style Human Approval -- persists the real Human Review decision from 13-4C-18
+# (COLOR_ONLY candidate) as the success_style category approval. Append-only, exactly like
+# 13-4C-6/9/11/13/15/17. The approved values are recomputed from the same build_success_style_
+# candidates() used by the Review stage -- never hardcoded separately, so review candidate and
+# approval candidate can never drift apart.
+# ---------------------------------------------------------------------------
+
+HUMAN_SELECTED_SUCCESS_STYLE_CANDIDATE = "COLOR_ONLY"
+
+
+def run_success_style_human_approval(
+    db_path: Path, assets_dir: Path, reports_dir: Path, *, plan_id: int | None = None,
+    selected_candidate: str = HUMAN_SELECTED_SUCCESS_STYLE_CANDIDATE,
+) -> dict:
+    entry_gate = validate_visual_design_entry_gate(db_path, assets_dir, plan_id=plan_id)
+    if not entry_gate["pass"]:
+        return {"pass": False, "reason": entry_gate["reason"], "plan_id": entry_gate.get("plan_id")}
+    pid = entry_gate["plan_id"]
+
+    canonical = select_canonical_visual_approval(db_path, pid)
+    if canonical is None:
+        return {"pass": False, "reason": "No canonical CANONICAL_CORRECTION visual_design_specs row found -- run `correct-visual-approval` first.", "plan_id": pid}
+
+    prior_id, prior_record = canonical["id"], canonical["design"]
+    if prior_record.get("selected_candidate") != "CLEAN_DARK_FOCUS":
+        return {"pass": False, "reason": f"Canonical visual candidate is {prior_record.get('selected_candidate')!r}, not CLEAN_DARK_FOCUS -- this approval is scoped to CLEAN_DARK_FOCUS only.", "plan_id": pid}
+
+    prior_categories = prior_record.get("category_approvals", {})
+    for required in ("font_family", "background", "color_palette", "typography_scale", "font_weight", "caption_style", "focus_style"):
+        if prior_categories.get(required, {}).get("resolution_status") != "APPROVED":
+            return {"pass": False, "reason": f"{required} must be Human Review approved before success_style.", "plan_id": pid}
+    if prior_categories.get("success_style", {}).get("resolution_status") == "APPROVED":
+        return {"pass": False, "reason": "success_style is already APPROVED on the current canonical record.", "plan_id": pid}
+
+    # Recompute the candidates with the exact same deterministic function 13-4C-18 used -- never
+    # hardcode the selected style, so review candidate and approval candidate can never drift apart.
+    candidates = build_success_style_candidates()
+
+    if selected_candidate not in candidates:
+        return {"pass": False, "reason": f"{selected_candidate!r} is not a real Success Style candidate (choices: {sorted(candidates)})", "plan_id": pid}
+    if selected_candidate != HUMAN_SELECTED_SUCCESS_STYLE_CANDIDATE:
+        return {
+            "pass": False,
+            "reason": (
+                f"No recorded Human Review decision for {selected_candidate!r} -- only "
+                f"{HUMAN_SELECTED_SUCCESS_STYLE_CANDIDATE!r} has an actual Human Review approval on record."
+            ),
+            "plan_id": pid,
+        }
+
+    approved_style = dict(candidates[selected_candidate])
+    resolved_success_color = prior_categories["color_palette"]["resolved_style"][approved_style["color_role"]]
+
+    new_categories = dict(prior_categories)
+    new_categories["success_style"] = {
+        "resolved_style": approved_style,
+        "resolution_status": "APPROVED",
+        "reason": "Human Review approved on the 13-4C-18 Success Style Prototype",
+        "provenance": {
+            "review_stage": "13-4C-19", "review_type": "HUMAN_VISUAL_REVIEW",
+            "review_source": "13-4C-18 Success Style Human Review Prototype",
+            "human_decision": "APPROVED", "selected_candidate": selected_candidate,
+            "resolved_success_color": resolved_success_color,
+            "human_decision_source": "current conversation -- option 1 / COLOR_ONLY",
+        },
+    }
+
+    candidate_selection = {
+        "selected_candidate": prior_record.get("selected_candidate"),
+        "candidate_selection_status": prior_record.get("candidate_selection_status"),
+    }
+    ready = ready_for_final_renderer_binding(candidate_selection, {"categories": new_categories})
+    approved_count = sum(1 for c in new_categories.values() if c["resolution_status"] == "APPROVED")
+    pending_count = len(new_categories) - approved_count
+
+    new_record = {
+        **prior_record,
+        "record_status": "CANONICAL_CORRECTION",
+        "revision": "13-4C-19",
+        "corrects_record_id": prior_id,
+        "correction_reason": "SUCCESS_STYLE_HUMAN_APPROVAL",
+        "correction_details": (
+            f"success_style Human Review approved ({selected_candidate}: {approved_style}); "
+            f"every other category is carried forward unchanged from record id={prior_id}."
+        ),
+        "category_approvals": new_categories,
+        "full_profile_approved": False,
+        "ready_for_final_renderer_binding": ready,
+    }
+
+    row_id = persist_visual_design(db_path, pid, prior_id, new_record, {"checks": {}, "unresolved_critical": [], "unresolved_non_critical": []})
+
+    profile_path = assets_dir / "generated" / f"plan_{pid}" / "render" / "approved_visual_profile.json"
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text(json.dumps(new_record, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    report_path = _build_success_style_human_approval_report(reports_dir, pid, new_record, prior_id, row_id, approved_count, pending_count, ready, profile_path)
+
+    return {
+        "pass": True, "plan_id": pid, "approved_style": approved_style, "selected_candidate": selected_candidate,
+        "resolved_success_color": resolved_success_color, "record": new_record, "prior_canonical_id": prior_id,
+        "visual_design_row_id": row_id, "approved_category_count": approved_count, "pending_category_count": pending_count,
+        "full_profile_approved": False, "ready_for_final_renderer_binding": ready, "json_path": profile_path,
+        "report_path": report_path,
+    }
+
+
+def _build_success_style_human_approval_report(
+    reports_dir: Path, plan_id: int, record: dict, prior_id: int, row_id: int,
+    approved_count: int, pending_count: int, ready: bool, profile_path: Path,
+) -> Path:
+    cat = record["category_approvals"]["success_style"]
+    style = cat["resolved_style"]
+    prov = cat["provenance"]
+
+    lines: list[str] = ["# Success Style Human Approval Report", ""]
+    lines.append(f"생성일: {datetime.utcnow().date().isoformat()}")
+    lines.append(f"Source Plan: {plan_id}")
+    lines.append("")
+    lines.append("## Human Decision")
+    lines.append("")
+    lines.append('Source: 사용자가 실제 대화에서 "COLOR_ONLY(1번)"를 선택')
+    lines.append(f"Selected candidate: {prov['selected_candidate']}")
+    lines.append("")
+    lines.append("## Approved Success Style")
+    lines.append("")
+    lines.append(f"- color_role: {style['color_role']} (resolved: {prov['resolved_success_color']})")
+    lines.append(f"- highlight_box: {style['highlight_box']}")
+    lines.append(f"- box_opacity: {style['box_opacity']}")
+    lines.append(f"- padding: {style['padding']}")
+    lines.append(f"- underline: {style['underline']}")
+    lines.append("")
+    lines.append("## Accessibility Note")
+    lines.append("")
+    lines.append(
+        "COLOR_ONLY conveys SUCCESS through color alone (no box, no underline). This is a Human "
+        "visual choice, not a claim that a project-wide color_not_sole_cue requirement (if any) is "
+        "automatically satisfied."
+    )
+    lines.append("")
+    lines.append("## Fixed Approvals (preserved, not re-approved)")
+    lines.append("")
+    lines.append(f"Font Family: {record['category_approvals']['font_family']['resolution_status']} ({record['category_approvals']['font_family']['resolved_style']})")
+    lines.append(f"Background: {record['category_approvals']['background']['resolution_status']} ({record['category_approvals']['background']['resolved_style']})")
+    lines.append(f"Color Palette: {record['category_approvals']['color_palette']['resolution_status']} (SUCCESS={record['category_approvals']['color_palette']['resolved_style']['SUCCESS']})")
+    lines.append(f"Typography Scale: {record['category_approvals']['typography_scale']['resolution_status']} ({record['category_approvals']['typography_scale']['resolved_style']})")
+    lines.append(f"Font Weight: {record['category_approvals']['font_weight']['resolution_status']} ({record['category_approvals']['font_weight']['resolved_style']})")
+    lines.append(f"Caption Style: {record['category_approvals']['caption_style']['resolution_status']} ({record['category_approvals']['caption_style']['resolved_style']})")
+    lines.append(f"Focus Style: {record['category_approvals']['focus_style']['resolution_status']} ({record['category_approvals']['focus_style']['resolved_style']})")
+    lines.append("")
+    lines.append(f"## Category Approvals ({approved_count} APPROVED / {pending_count} PENDING)")
+    lines.append("")
+    for name, c in record["category_approvals"].items():
+        lines.append(f"- {name}: {c['resolution_status']}")
+    lines.append("")
+    lines.append("## Renderer Gate")
+    lines.append("")
+    lines.append(f"Full Profile Approved: {'YES' if record['full_profile_approved'] else 'NO'}")
+    lines.append(f"Ready for Final Renderer Binding: {'YES' if ready else 'NO'}")
+    lines.append("")
+    lines.append("## DB Append-only")
+    lines.append("")
+    lines.append(f"이전 canonical record id: {prior_id} (수정되지 않음)")
+    lines.append(f"신규 canonical record id: {row_id}")
+    lines.append("")
+    lines.append(f"JSON: {profile_path}")
+    lines.append("")
+
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    out_path = reports_dir / f"success_style_human_approval_{datetime.utcnow().date().isoformat()}.md"
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return out_path

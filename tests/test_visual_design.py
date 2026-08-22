@@ -29,6 +29,7 @@ from research.visual_design import (
     HUMAN_SELECTED_FOCUS_STYLE_CANDIDATE,
     HUMAN_SELECTED_FONT_WEIGHT_CANDIDATE,
     HUMAN_SELECTED_MUTED_CANDIDATE,
+    HUMAN_SELECTED_SUCCESS_STYLE_CANDIDATE,
     HUMAN_SELECTED_TYPOGRAPHY_CANDIDATE,
     MUTED_CANDIDATE_FACTORS,
     TYPOGRAPHY_SCALE_CANDIDATE_DELTAS,
@@ -60,6 +61,7 @@ from research.visual_design import (
     run_font_weight_human_approval,
     run_font_weight_review,
     run_muted_color_refinement,
+    run_success_style_human_approval,
     run_success_style_review,
     run_typography_scale_human_approval,
     run_typography_scale_review,
@@ -4387,3 +4389,245 @@ def test_run_success_style_review_prompt_to_answer_uses_real_cb06_data(tmp_path)
     answer_div = re.search(r'<div data-success-element style="[^"]*">cap</div>', frame)
     assert answer_div is not None
     assert "background:rgba" in answer_div.group(0)  # STRONG_SUCCESS has highlight_box=True
+
+
+# ---------------------------------------------------------------------------
+# 13-4C-19: Success Style Human Approval -- persists the real Human Review decision (COLOR_ONLY
+# from 13-4C-18) as the success_style approval. Append-only, exactly like 13-4C-6/9/11/13/15/17.
+# ---------------------------------------------------------------------------
+
+def _ready_plan_with_success_style_approved(tmp_path, db_path):
+    plan_id, assets_dir, reports_dir, focus_result = _ready_plan_with_focus_style_approved(tmp_path, db_path)
+    success_result = run_success_style_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    assert success_result["pass"] is True
+    return plan_id, assets_dir, reports_dir, success_result
+
+
+def test_human_selected_success_style_candidate_constant_is_color_only():
+    assert HUMAN_SELECTED_SUCCESS_STYLE_CANDIDATE == "COLOR_ONLY"
+
+
+# 1. actual selected candidate can be approved
+def test_run_success_style_human_approval_end_to_end(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, focus_result = _ready_plan_with_focus_style_approved(tmp_path, db_path)
+    prior_id = focus_result["visual_design_row_id"]
+    with connect(db_path) as conn:
+        before_count = conn.execute("SELECT COUNT(*) c FROM visual_design_specs WHERE production_plan_id = ?", (plan_id,)).fetchone()["c"]
+        prior_json_before = conn.execute("SELECT design_json FROM visual_design_specs WHERE id = ?", (prior_id,)).fetchone()["design_json"]
+
+    result = run_success_style_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    assert result["pass"] is True
+    assert result["selected_candidate"] == "COLOR_ONLY"
+
+    expected = SUCCESS_STYLE_CANDIDATES["COLOR_ONLY"]
+    assert result["approved_style"] == expected
+    assert result["resolved_success_color"] == "#4ade80"
+
+    cat = result["record"]["category_approvals"]["success_style"]
+    assert cat["resolution_status"] == "APPROVED"
+    assert cat["resolved_style"] == expected
+    assert cat["provenance"]["review_stage"] == "13-4C-19"
+    assert cat["provenance"]["selected_candidate"] == "COLOR_ONLY"
+    assert cat["provenance"]["resolved_success_color"] == "#4ade80"
+
+    assert result["record"]["category_approvals"]["focus_style"]["resolution_status"] == "APPROVED"
+    assert result["record"]["category_approvals"]["focus_style"]["resolved_style"]["color_role"] == "PRIMARY_FOCUS"
+    assert result["full_profile_approved"] is False
+    assert result["ready_for_final_renderer_binding"] is False
+    assert result["approved_category_count"] == 8
+    assert result["pending_category_count"] == 7
+
+    with connect(db_path) as conn:
+        after_count = conn.execute("SELECT COUNT(*) c FROM visual_design_specs WHERE production_plan_id = ?", (plan_id,)).fetchone()["c"]
+        prior_json_after = conn.execute("SELECT design_json FROM visual_design_specs WHERE id = ?", (prior_id,)).fetchone()["design_json"]
+    assert after_count == before_count + 1
+    assert prior_json_after == prior_json_before
+
+    profile = json.loads(result["json_path"].read_text(encoding="utf-8"))
+    assert profile["category_approvals"]["success_style"]["resolution_status"] == "APPROVED"
+    assert profile["category_approvals"]["success_style"]["resolved_style"] == expected
+
+
+# 3. missing canonical state rejected
+def test_run_success_style_human_approval_fails_without_focus_style(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, caption_result = _ready_plan_with_caption_style_approved(tmp_path, db_path)
+    result = run_success_style_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    assert result["pass"] is False
+
+
+# 5. success_style already approved rejected
+def test_run_success_style_human_approval_rejects_when_already_approved(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, focus_result = _ready_plan_with_focus_style_approved(tmp_path, db_path)
+    first = run_success_style_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    assert first["pass"] is True
+    second = run_success_style_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    assert second["pass"] is False
+
+
+# 2. wrong candidate rejected -- BALANCED_SUCCESS
+def test_run_success_style_human_approval_rejects_balanced_success(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, focus_result = _ready_plan_with_focus_style_approved(tmp_path, db_path)
+    result = run_success_style_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id, selected_candidate="BALANCED_SUCCESS")
+    assert result["pass"] is False
+
+
+# 2. wrong candidate rejected -- STRONG_SUCCESS
+def test_run_success_style_human_approval_rejects_strong_success(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, focus_result = _ready_plan_with_focus_style_approved(tmp_path, db_path)
+    result = run_success_style_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id, selected_candidate="STRONG_SUCCESS")
+    assert result["pass"] is False
+
+
+def test_run_success_style_human_approval_rejects_unknown_candidate(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, focus_result = _ready_plan_with_focus_style_approved(tmp_path, db_path)
+    with connect(db_path) as conn:
+        before = conn.execute("SELECT COUNT(*) c FROM visual_design_specs WHERE production_plan_id = ?", (plan_id,)).fetchone()["c"]
+    result = run_success_style_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id, selected_candidate="NOT_REAL")
+    assert result["pass"] is False
+    with connect(db_path) as conn:
+        after = conn.execute("SELECT COUNT(*) c FROM visual_design_specs WHERE production_plan_id = ?", (plan_id,)).fetchone()["c"]
+    assert after == before
+
+
+# 6/9/10: existing font_family/background/color_palette/typography_scale/font_weight/caption_style/
+# focus_style approvals preserved exactly
+def test_run_success_style_human_approval_preserves_other_approvals(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, focus_result = _ready_plan_with_focus_style_approved(tmp_path, db_path)
+    before_font = focus_result["record"]["category_approvals"]["font_family"]
+    before_bg = focus_result["record"]["category_approvals"]["background"]
+    before_palette = focus_result["record"]["category_approvals"]["color_palette"]
+    before_typo = focus_result["record"]["category_approvals"]["typography_scale"]
+    before_weight = focus_result["record"]["category_approvals"]["font_weight"]
+    before_caption = focus_result["record"]["category_approvals"]["caption_style"]
+    before_focus = focus_result["record"]["category_approvals"]["focus_style"]
+    result = run_success_style_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    assert result["record"]["category_approvals"]["font_family"] == before_font
+    assert result["record"]["category_approvals"]["background"] == before_bg
+    assert result["record"]["category_approvals"]["color_palette"] == before_palette
+    assert result["record"]["category_approvals"]["typography_scale"] == before_typo
+    assert result["record"]["category_approvals"]["font_weight"] == before_weight
+    assert result["record"]["category_approvals"]["caption_style"] == before_caption
+    assert result["record"]["category_approvals"]["focus_style"] == before_focus
+
+
+# 11: motion_style and every other unrelated pending category never becomes APPROVED
+def test_run_success_style_human_approval_no_unrelated_auto_approval(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, focus_result = _ready_plan_with_focus_style_approved(tmp_path, db_path)
+    result = run_success_style_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    for name in ("motion_style", "output_profile_16_9", "output_profile_9_16", "spacing_scale", "container", "border", "radius"):
+        assert result["record"]["category_approvals"][name]["resolution_status"] == "PENDING_VISUAL_REVIEW"
+
+
+# 12/13: append-only -- exactly one new row, prior row byte-for-byte unchanged
+def test_run_success_style_human_approval_prior_row_unchanged(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, focus_result = _ready_plan_with_focus_style_approved(tmp_path, db_path)
+    prior_id = focus_result["visual_design_row_id"]
+    with connect(db_path) as conn:
+        before = conn.execute("SELECT design_json FROM visual_design_specs WHERE id = ?", (prior_id,)).fetchone()["design_json"]
+    run_success_style_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    with connect(db_path) as conn:
+        after = conn.execute("SELECT design_json FROM visual_design_specs WHERE id = ?", (prior_id,)).fetchone()["design_json"]
+    assert before == after
+
+
+def test_run_success_style_human_approval_exactly_one_new_row(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, focus_result = _ready_plan_with_focus_style_approved(tmp_path, db_path)
+    with connect(db_path) as conn:
+        before = conn.execute("SELECT COUNT(*) c FROM visual_design_specs WHERE production_plan_id = ?", (plan_id,)).fetchone()["c"]
+    run_success_style_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    with connect(db_path) as conn:
+        after = conn.execute("SELECT COUNT(*) c FROM visual_design_specs WHERE production_plan_id = ?", (plan_id,)).fetchone()["c"]
+    assert after == before + 1
+
+
+# Renderer gates stay False -- 7 mandatory-or-optional categories still PENDING
+def test_run_success_style_human_approval_gates_stay_false(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, focus_result = _ready_plan_with_focus_style_approved(tmp_path, db_path)
+    result = run_success_style_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    assert result["record"]["full_profile_approved"] is False
+    assert result["record"]["ready_for_final_renderer_binding"] is False
+
+
+# 16: production/audio/layout tables untouched
+def test_run_success_style_human_approval_production_data_untouched(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, focus_result = _ready_plan_with_focus_style_approved(tmp_path, db_path)
+    with connect(db_path) as conn:
+        before = {t: conn.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"] for t in ("production_blocks", "speech_assets", "generated_assets", "render_specs", "render_timelines", "scene_layouts")}
+    run_success_style_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    with connect(db_path) as conn:
+        after = {t: conn.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"] for t in before}
+    assert before == after
+
+
+# 15: existing Success Style Review artifact (13-4C-18) is never modified
+def test_run_success_style_human_approval_does_not_touch_review_artifact(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    plan_id, assets_dir, reports_dir, focus_result = _ready_plan_with_focus_style_approved(tmp_path, db_path)
+    review_result = run_success_style_review(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    manifest_before = (review_result["review_dir"] / "manifest.json").read_text(encoding="utf-8")
+    run_success_style_human_approval(db_path, assets_dir, reports_dir, plan_id=plan_id)
+    manifest_after = (review_result["review_dir"] / "manifest.json").read_text(encoding="utf-8")
+    assert manifest_before == manifest_after
+
+
+# 17: deterministic resolution across independent runs
+def test_run_success_style_human_approval_deterministic_values(tmp_path):
+    db_path1 = tmp_path / "test1.db"
+    init_db(db_path1)
+    plan_id1, assets_dir1, reports_dir1, focus_result1 = _ready_plan_with_focus_style_approved(tmp_path, db_path1)
+    result1 = run_success_style_human_approval(db_path1, assets_dir1, reports_dir1, plan_id=plan_id1)
+
+    tmp_path2 = tmp_path / "second"
+    tmp_path2.mkdir()
+    db_path2 = tmp_path2 / "test2.db"
+    init_db(db_path2)
+    plan_id2, assets_dir2, reports_dir2, focus_result2 = _ready_plan_with_focus_style_approved(tmp_path2, db_path2)
+    result2 = run_success_style_human_approval(db_path2, assets_dir2, reports_dir2, plan_id=plan_id2)
+
+    assert result1["approved_style"] == result2["approved_style"]
+    assert result1["resolved_success_color"] == result2["resolved_success_color"]
+
+
+# 4/18: secondary-machine / incomplete-DB safety gate -- the exact real-world scenario this stage's
+# spec was written for: current code + DB schema present, but no canonical Plan lineage at all (no
+# production_plans row, therefore no scene_layouts/render_specs/visual_design_specs either). The
+# approval must fail safely without reconstructing, synthesizing, or fabricating any canonical state.
+def test_run_success_style_human_approval_secondary_machine_incomplete_db_safety_gate(tmp_path):
+    db_path = tmp_path / "test.db"
+    init_db(db_path)  # schema only -- no production_plans row, no canonical visual lineage
+    assets_dir = tmp_path / "assets"
+    reports_dir = tmp_path / "reports"
+
+    result = run_success_style_human_approval(db_path, assets_dir, reports_dir, plan_id=7)
+
+    assert result["pass"] is False
+    with connect(db_path) as conn:
+        tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        for t in ("production_plans", "visual_design_specs", "render_specs", "render_timelines", "scene_layouts"):
+            assert t in tables  # schema exists
+            assert conn.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"] == 0  # but stays empty -- nothing fabricated
